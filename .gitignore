@@ -1,0 +1,5 @@
+*.txt
+*.xlsx
+*.csv
+*.png
+knowledge_layer\__pycache__\*
