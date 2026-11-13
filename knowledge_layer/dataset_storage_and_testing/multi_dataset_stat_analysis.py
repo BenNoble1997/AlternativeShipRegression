@@ -10,14 +10,54 @@ import numpy as np
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from parameters.shipshape.ShipShapeBasic_class import ShipType
-from distribution_comparison_class import DistributionComparison
+from knowledge_layer.dataset_storage_and_testing.distribution_comparison_class import DistributionComparison
 
+def _significance_symbol(
+    median_sig: bool,
+    mean_sig: bool,
+    available: bool = True
+) -> str:
+    """
+    Map a (median, mean) significance pair onto a single LaTeX macro.
+
+    Encodes the two-boolean cross-tabulation used by the combined bootstrap
+    table into a four-state symbol, plus an unavailability state:
+
+    ==========  ========  =================
+    median_sig  mean_sig  macro
+    ==========  ========  =================
+    True        True      ``\\bothsig``
+    True        False     ``\\mediansig``
+    False       True      ``\\meansig``
+    False       False     ``\\notsig``
+    ==========  ========  =================
+
+    :param median_sig: Whether the bootstrap CI on the median difference excludes zero.
+    :type median_sig: bool
+    :param mean_sig: Whether the bootstrap CI on the mean difference excludes zero.
+    :type mean_sig: bool
+    :param available: Whether the feature exists for this ship type / fuel type.
+        If ``False``, ``\\na`` is returned regardless of the significance flags.
+    :type available: bool
+    :returns: A LaTeX macro string (with leading backslash, no trailing space).
+    :rtype: str
+    """
+    if not available:
+        return r'\na'
+    if median_sig and mean_sig:
+        return r'\bothsig'
+    if median_sig:
+        return r'\mediansig'
+    if mean_sig:
+        return r'\meansig'
+    return r'\notsig'
 
 def collect_mann_whitney_results(
     fleet,
     ship_type: ShipType,
     features: List[str],
-        conventional_type:str='matched',
+        conventional_type:str,
+        alternative_datasets:list[str],
     matching_parameter: str = 'DWT',
     n_matches_per_ship: int = 10,
     use_ratios: bool = False
@@ -63,14 +103,14 @@ def collect_mann_whitney_results(
     pd.DataFrame
         Results with columns: Feature, ShipType, DualFuel_p, PureAlt_p
     """
-    from distribution_comparison_class import DistributionComparison
+    from knowledge_layer.dataset_storage_and_testing.distribution_comparison_class import DistributionComparison
 
     results = []
 
     # Get datasets
     conventional_df = fleet.processed_data['pure_conventional']
 
-    for fuel_type in ['dual_fuel', 'pure_alt_fuel']:
+    for fuel_type in alternative_datasets:
         try:
             alternative_df = fleet.processed_data[fuel_type]
 
@@ -187,8 +227,9 @@ def collect_bootstrap_results(
     fleet,
     ship_type: ShipType,
     features: List[str],
-    ci_method:str='bca',
-    conventional_type:str='matched',
+    conventional_type: str,
+        alternative_datasets:list[str],
+    ci_method: str = 'bca',
     matching_parameter: str = 'DWT',
     n_matches_per_ship: int = 10,
     n_bootstrap: int = 10000,
@@ -197,59 +238,56 @@ def collect_bootstrap_results(
     """
     Run bootstrap CI tests for a single ship type and return structured results.
 
-    This tests whether the difference in mean and median is significant
-    using bootstrap confidence intervals.
+    Tests whether the difference in mean and median between the alternative-fuel
+    dataset and a conventional reference dataset is significant, using bootstrap
+    confidence intervals on the difference statistic. A CI excluding zero implies
+    a significant difference at the stated alpha.
 
-    RATIO ANALYSIS CONCEPT:
-    When use_ratios=True, we test ratios (e.g., LBP/DWT) instead of absolute values.
-    This is particularly powerful for bootstrap tests because:
-    - Mean ratio difference: Tests if average proportions differ (e.g., alternative
-      fuel ships are systematically 5% wider relative to DWT)
-    - Median ratio difference: Tests if typical proportions differ (robust to outliers)
-
-    Example interpretation: If mean LBP/DWT for alternative fuel is 0.0031 and for
-    conventional is 0.0029, the bootstrap test tells you if this 7% proportional
-    difference is statistically significant or just sampling noise.
-
-    Parameters
-    ----------
-    fleet : FleetData
-        Fleet data object with processed datasets
-    ship_type : ShipType
-        Type of ship being analyzed
-    features : List[str]
-        Features to test
-    matching_parameter : str
-        Parameter to use for matching
-    n_matches_per_ship : int
-        Number of matches per alternative ship
-    n_bootstrap : int
-        Number of bootstrap samples
-    use_ratios : bool
-        If True, test feature/matching_parameter ratios instead of absolute values
-
-    ci_method : str
-        Method to use for determining confidence intervals. Can be percentile, bca or t test
-
-    conventional_type : str
-        Specify whether full dataset, overlap, or matched dataset is used
-
-    Returns
-    -------
-    pd.DataFrame
-        Results with columns: Feature, ShipType, FuelType, mean_sig, median_sig
+    :param fleet: Fleet data object with processed datasets.
+    :type fleet: FleetData
+    :param ship_type: Ship type being analysed.
+    :type ship_type: ShipType
+    :param features: Features to test.
+    :type features: List[str]
+    :param ci_method: Confidence interval method (``'percentile'``, ``'bca'`` or ``'t'``).
+    :type ci_method: str
+    :param conventional_type: Conventional reference to compare against
+        (``'matched'``, ``'overlap'`` or anything else for the full fleet).
+    :type conventional_type: str
+    :param matching_parameter: Parameter used for matching/overlap and ratio denominators.
+    :type matching_parameter: str
+    :param n_matches_per_ship: Number of conventional matches per alternative ship.
+    :type n_matches_per_ship: int
+    :param n_bootstrap: Number of bootstrap resamples.
+    :type n_bootstrap: int
+    :param use_ratios: If ``True``, test ``feature / matching_parameter`` ratios
+        rather than absolute values, controlling for size.
+    :type use_ratios: bool
+    :returns: Results with columns ``Feature``, ``ShipType``, ``FuelType``,
+        ``mean_sig``, ``median_sig``, ``available``. ``available`` is ``False``
+        when the feature does not exist for that ship type, allowing the LaTeX
+        generator to emit ``\\na`` rather than falsely reporting non-significance.
+    :rtype: pd.DataFrame
     """
-
 
     results = []
 
-    for fuel_type in ['dual_fuel', 'pure_alt_fuel']:
+    def _record(feature: str, mean_sig: bool, median_sig: bool, available: bool) -> None:
+        """Append a single result row with a consistent schema."""
+        results.append({
+            'Feature': feature if not use_ratios else f'{feature}/{matching_parameter}',
+            'ShipType': ship_type.name,
+            'FuelType': fuel_type,
+            'mean_sig': mean_sig,
+            'median_sig': median_sig,
+            'available': available,
+        })
+
+    for fuel_type in alternative_datasets:
         try:
             alternative_df = fleet.processed_data[fuel_type]
 
             if conventional_type == 'matched':
-
-                # Create matched dataset
                 conventional_df = fleet.add_matched_dataset(
                     alternative_df=fuel_type,
                     conventional_df='pure_conventional',
@@ -258,108 +296,70 @@ def collect_bootstrap_results(
                     store_dataset=False,
                     name=f'matched_{matching_parameter}_{fuel_type}'
                 )
-
             elif conventional_type == 'overlap':
-
-                name = matching_parameter+'overlap'
-
-                conventional_df = fleet.add_overlap_dataset(alternative_df=fuel_type,
-                                                         conventional_df='pure_conventional',
-                                                         parameter=matching_parameter,
-                                                            name=name)
-
+                conventional_df = fleet.add_overlap_dataset(
+                    alternative_df=fuel_type,
+                    conventional_df='pure_conventional',
+                    parameter=matching_parameter,
+                    name=matching_parameter + 'overlap'
+                )
             else:
                 conventional_df = fleet.processed_data['pure_conventional'].copy()
 
-
-            # Create ratio columns if requested
             if use_ratios:
                 conventional_df = conventional_df.copy()
                 alternative_df = alternative_df.copy()
 
-                # Check if matching parameter exists
                 if matching_parameter not in conventional_df.columns:
-                    print(f"Warning: {matching_parameter} not in matched conventional dataset")
+                    print(f"Warning: {matching_parameter} not in conventional dataset")
                     continue
                 if matching_parameter not in alternative_df.columns:
                     print(f"Warning: {matching_parameter} not in alternative dataset")
                     continue
 
-            # Run comparison
             comparison = DistributionComparison(
                 conventional_data=conventional_df,
                 alternative_data=alternative_df
             )
 
-            # Test each feature
             for feature in features:
-                # Determine the actual column to test
                 if use_ratios:
-                    # Create ratio column name
-                    ratio_col = f'{feature}/{matching_parameter}'
-
-                    # Check if feature exists and create ratio
-                    if feature in conventional_df.columns and feature in alternative_df.columns:
-                        # Create ratio columns
-                        conventional_df[ratio_col] = (
-                            conventional_df[feature] / conventional_df[matching_parameter]
-                        )
-                        alternative_df[ratio_col] = (
-                            alternative_df[feature] / alternative_df[matching_parameter]
-                        )
-
-                        test_column = ratio_col
-                    else:
-                        # Feature not available
-                        results.append({
-                            'Feature': feature if not use_ratios else f'{feature}/{matching_parameter}',
-                            'ShipType': ship_type.name,
-                            'FuelType': fuel_type,
-                            'mean_sig': False,
-                            'median_sig': False
-                        })
+                    if feature not in conventional_df.columns or feature not in alternative_df.columns:
+                        _record(feature, False, False, available=False)
                         continue
+
+                    ratio_col = f'{feature}/{matching_parameter}'
+                    conventional_df[ratio_col] = (
+                        conventional_df[feature] / conventional_df[matching_parameter]
+                    )
+                    alternative_df[ratio_col] = (
+                        alternative_df[feature] / alternative_df[matching_parameter]
+                    )
+                    test_column = ratio_col
                 else:
                     test_column = feature
 
-                # Check if test column exists
                 if test_column in conventional_df.columns and test_column in alternative_df.columns:
-                    # Run bootstrap test
                     boot_result = comparison.bootstrap_difference_ci(
                         feature=test_column,
                         n_bootstrap=n_bootstrap,
                         ci_method=ci_method
                     )
-
-                    results.append({
-                        'Feature': feature if not use_ratios else f'{feature}/{matching_parameter}',
-                        'ShipType': ship_type.name,
-                        'FuelType': fuel_type,
-                        'mean_sig': boot_result['mean_significant'],
-                        'median_sig': boot_result['median_significant']
-                    })
+                    _record(
+                        feature,
+                        mean_sig=bool(boot_result['mean_significant']),
+                        median_sig=bool(boot_result['median_significant']),
+                        available=True,
+                    )
                 else:
-                    # Feature not available
-                    results.append({
-                        'Feature': feature if not use_ratios else f'{feature}/{matching_parameter}',
-                        'ShipType': ship_type.name,
-                        'FuelType': fuel_type,
-                        'mean_sig': False,
-                        'median_sig': False
-                    })
+                    _record(feature, False, False, available=False)
 
         except Exception as e:
             print(f"Error processing {ship_type.name} - {fuel_type}: {e}")
             import traceback
             traceback.print_exc()
             for feature in features:
-                results.append({
-                    'Feature': feature if not use_ratios else f'{feature}/{matching_parameter}',
-                    'ShipType': ship_type.name,
-                    'FuelType': fuel_type,
-                    'mean_sig': False,
-                    'median_sig': False
-                })
+                _record(feature, False, False, available=False)
 
     return pd.DataFrame(results)
 
@@ -368,6 +368,7 @@ def create_mann_whitney_comparison_table(
     all_results: pd.DataFrame,
     all_features: List[str],
     ship_types: List[ShipType],
+    alternative_datasets,
     output_file: Optional[str] = None,
     variable_name_map: Optional[Dict[str, str]] = None,
     conventional_type:str = 'matched'
@@ -452,7 +453,7 @@ def create_mann_whitney_comparison_table(
 
         for ship_type in ship_types:
             # Get results for this ship type and feature
-            for fuel_type in ['dual_fuel', 'pure_alt_fuel']:
+            for fuel_type in alternative_datasets:
                 # Search using ORIGINAL feature name
                 mask = (
                     (all_results['Feature'] == feature) &
@@ -755,6 +756,258 @@ def create_bootstrap_median_comparison_table(
 
     return latex_code
 
+def _validate_table_inputs(
+    all_results: pd.DataFrame,
+    all_features: List[str],
+    ship_types: List[ShipType],
+    raise_on_empty: bool = True
+) -> None:
+    """
+    Verify that the requested (feature, ship type) keys actually exist in the results.
+
+    A LaTeX table that is entirely ``\\na`` is indistinguishable from a table where
+    every feature is genuinely unavailable, so a silent key mismatch (e.g. a
+    display name used where an original column name was expected) produces a
+    plausible-looking but meaningless table. This check makes that failure loud.
+
+    :param all_results: Combined bootstrap results.
+    :type all_results: pd.DataFrame
+    :param all_features: Feature names the table will look up.
+    :type all_features: List[str]
+    :param ship_types: Ship types the table will look up.
+    :type ship_types: List[ShipType]
+    :param raise_on_empty: If ``True``, raise on a total key mismatch rather than
+        emitting an all-``\\na`` table.
+    :type raise_on_empty: bool
+    :raises ValueError: If no requested feature or ship type is present in the results.
+    """
+    if all_results.empty:
+        raise ValueError("combined bootstrap results frame is empty")
+
+    result_features = set(all_results['Feature'].unique())
+    result_ships = set(all_results['ShipType'].unique())
+    requested_ships = {s.name for s in ship_types}
+
+    feature_overlap = result_features & set(all_features)
+    ship_overlap = result_ships & requested_ships
+
+    if not feature_overlap:
+        msg = (
+            "No requested feature appears in the results.\n"
+            f"  requested : {sorted(all_features)}\n"
+            f"  in results: {sorted(result_features)}"
+        )
+        if raise_on_empty:
+            raise ValueError(msg)
+        print("WARNING: " + msg)
+
+    if not ship_overlap:
+        msg = (
+            "No requested ship type appears in the results.\n"
+            f"  requested : {sorted(requested_ships)}\n"
+            f"  in results: {sorted(result_ships)}"
+        )
+        if raise_on_empty:
+            raise ValueError(msg)
+        print("WARNING: " + msg)
+
+def create_bootstrap_combined_comparison_table(
+    all_results: pd.DataFrame,
+    all_features: List[str],
+    ship_types: List[ShipType],
+    alternative_datasets:list[str],
+    conventional_type: str = 'matched',
+    output_file: Optional[str] = None,
+    variable_name_map: Optional[Dict[str, str]] = None,
+    n_bootstrap: int = 10000,
+    label_suffix: str = '',
+    feature_col_width: float = 0.10,
+    data_col_width: float = 0.08,
+    use_table_star: bool = True,
+    verbose: bool = True
+) -> str:
+    """
+    Create a single LaTeX table combining bootstrap mean and median significance.
+
+    Rather than emitting two separate tables (one for the mean, one for the
+    median), each cell encodes both tests simultaneously via a four-state macro
+    (``\\bothsig``, ``\\mediansig``, ``\\meansig``, ``\\notsig``), with ``\\na``
+    for features that do not exist for a given ship type. This halves the number
+    of tables while preserving all information, and makes it directly visible
+    where the mean and median tests disagree — a disagreement that is itself
+    informative, since a mean-only difference indicates the shift is driven by
+    the tails/outliers whereas a median-only difference indicates a shift in the
+    bulk of the distribution.
+
+    The table is emitted as a ``table*`` float by default so it spans both
+    columns of a two-column journal layout, and the legend is folded into the
+    caption (avoiding a dependency on ``threeparttable`` for ``tablenotes``).
+
+    :param all_results: Combined bootstrap results across ship types, as produced
+        by :func:`collect_bootstrap_results`. Must contain ``Feature``,
+        ``ShipType``, ``FuelType``, ``mean_sig``, ``median_sig`` and optionally
+        ``available``.
+    :type all_results: pd.DataFrame
+    :param all_features: Ordered list of feature names (original, not display)
+        forming the table rows.
+    :type all_features: List[str]
+    :param ship_types: Ship types forming the column groups, in display order.
+    :type ship_types: List[ShipType]
+    :param conventional_type: Conventional reference used, included in the label
+        and caption.
+    :type conventional_type: str
+    :param output_file: If given, path to write the LaTeX source to.
+    :type output_file: Optional[str]
+    :param variable_name_map: Mapping from original feature names to LaTeX
+        display names. Features not present fall back to their raw name.
+    :type variable_name_map: Optional[Dict[str, str]]
+    :param n_bootstrap: Number of resamples, quoted in the caption.
+    :type n_bootstrap: int
+    :param label_suffix: Extra text appended to the ``\\label`` key to keep
+        labels unique across runs (e.g. ``'_ratios'``).
+    :type label_suffix: str
+    :param feature_col_width: Width of the leading feature column, as a fraction
+        of ``\\linewidth``.
+    :type feature_col_width: float
+    :param data_col_width: Width of each data column, as a fraction of
+        ``\\linewidth``.
+    :type data_col_width: float
+    :param use_table_star: If ``True``, emit ``table*`` (spans both columns);
+        otherwise emit ``table[htbp]``.
+    :type use_table_star: bool
+    :param verbose: If ``True``, print per-stage debugging information about
+        column construction and cell lookups.
+    :type verbose: bool
+    :returns: The LaTeX table source.
+    :rtype: str
+    """
+
+    print("Running comparison analyser")
+    _validate_table_inputs(all_results, all_features,ship_types)
+
+    fuel_types = alternative_datasets
+    fuel_labels = alternative_datasets
+
+    if verbose:
+        print("[combined_table] ---- Stage 1: inputs ----")
+        print(f"[combined_table] ship types      : {[s.name for s in ship_types]}")
+        print(f"[combined_table] features        : {all_features}")
+        print(f"[combined_table] results rows    : {len(all_results)}")
+        print(f"[combined_table] has 'available' : {'available' in all_results.columns}")
+
+    has_available = 'available' in all_results.columns
+
+    lines = []
+
+    # ---- Stage 2: float, caption, label ----
+    env = 'table*' if use_table_star else 'table'
+    lines.append(r'\begin{' + env + '}' + ('' if use_table_star else '[htbp]'))
+    lines.append(r'    \centering')
+
+    caption = (
+        r'    \caption{Bootstrap confidence interval test for difference in median '
+        r'and mean between alternative-fuel and ' + conventional_type +
+        r' conventional ship datasets. '
+        r'\bothsig = significant difference in mean and median, '
+        r'\mediansig = significant difference in median, '
+        r'\meansig = significant difference in mean, '
+        r'\notsig = no significant difference. '
+        r'Bootstrap confidence intervals with ' + f'{n_bootstrap:,}' + r' resamples.}'
+    )
+    lines.append(caption)
+    lines.append(r'    \label{tab:bootstrap_combined_comparison_all_ships_'
+                 + conventional_type + label_suffix + '}')
+    lines.append(r'    \scriptsize')
+
+    # ---- Stage 3: column specification ----
+    col_spec = r'>{\raggedright\arraybackslash}p{' + f'{feature_col_width}' + r'\linewidth}'
+    for _ in ship_types:
+        col_spec += (r'>{\centering\arraybackslash}p{' + f'{data_col_width}' + r'\linewidth}') * len(fuel_types)
+
+    if verbose:
+        print("[combined_table] ---- Stage 3: column spec ----")
+        print(f"[combined_table] n data columns  : {len(ship_types) * len(fuel_types)}")
+        print(f"[combined_table] col_spec        : {col_spec}")
+
+    lines.append(r'    \begin{tabular}{' + col_spec + '}')
+    lines.append(r'        \toprule')
+
+    # ---- Stage 4: headers ----
+    header_parts = ['']
+    for ship_type in ship_types:
+        ship_name = ship_type.name.replace('_', ' ').title()
+        header_parts.append(r'\multicolumn{2}{c}{\textbf{' + ship_name + '}}')
+    lines.append('        ' + ' & '.join(header_parts) + r'\\')
+
+    cmidrule_parts = []
+    for i in range(len(ship_types)):
+        start_col = 2 + i * len(fuel_types)
+        end_col = start_col + len(fuel_types) - 1
+        cmidrule_parts.append(r'\cmidrule(lr){' + f'{start_col}-{end_col}' + '}')
+    lines.append('        ' + ' '.join(cmidrule_parts))
+
+    subheader_parts = [r'\textbf{Design variable}']
+    for _ in ship_types:
+        subheader_parts.extend(fuel_labels)
+    lines.append('        ' + '& '.join(subheader_parts) + r'\\')
+    lines.append(r'        \midrule')
+
+    # ---- Stage 5: data rows ----
+    if verbose:
+        print("[combined_table] ---- Stage 5: cell lookup ----")
+
+    for feature in all_features:
+        feature_display = (
+            variable_name_map[feature]
+            if variable_name_map is not None and feature in variable_name_map
+            else feature
+        )
+        row_parts = [feature_display]
+
+        for ship_type in ship_types:
+            for fuel_type in fuel_types:
+                mask = (
+                    (all_results['Feature'] == feature) &
+                    (all_results['ShipType'] == ship_type.name) &
+                    (all_results['FuelType'] == fuel_type)
+                )
+
+                if mask.any():
+                    row = all_results[mask].iloc[0]
+                    available = bool(row['available']) if has_available else True
+                    cell_str = _significance_symbol(
+                        median_sig=bool(row['median_sig']),
+                        mean_sig=bool(row['mean_sig']),
+                        available=available,
+                    )
+                else:
+                    cell_str = r'\na'
+
+                if verbose:
+                    print(f"[combined_table]   {feature:<12} | {ship_type.name:<14} "
+                          f"| {fuel_type:<13} -> {cell_str}")
+
+                row_parts.append(cell_str)
+
+        lines.append('        ' + ' & '.join(row_parts) + r' \\')
+
+    # ---- Stage 6: close ----
+    lines.append(r'        \bottomrule')
+    lines.append(r'    \end{tabular}')
+    lines.append(r'\end{' + env + '}')
+
+    latex_code = '\n'.join(lines)
+
+    if output_file:
+        Path(output_file).write_text(latex_code)
+        print(f"Bootstrap combined comparison table saved to: {output_file}")
+
+    if verbose:
+        print("[combined_table] ---- Stage 6: done ----")
+        print(f"[combined_table] emitted {len(lines)} lines")
+
+    return latex_code
+
 
 # Add to your hypothesis_testing.py at the bottom, before if __name__ == '__main__':
 
@@ -762,15 +1015,21 @@ def run_multi_ship_comparison(
     ship_types: List[ShipType],
     get_variables_func,
     getting_alt_fuel_ships_func,
-        bootstrap:bool=True,
-        mann_whitney:bool=True,
+        alternative_datasets:list[str],
+        fuel_type_columns:list[str],
+        max_build_year:int,
+        alt_fuels:dict[str,list[str]],
+        conventional_fuels:list[str],
+    bootstrap:bool=True,
+    combined_bootstrap_table:bool=True,
+    mann_whitney:bool=True,
     conventional_type:str = 'matched',
     output_dir: str = 'multi_ship_tables',
     matching_parameter: str = 'DWT',
     n_matches_per_ship: int = 10,
     use_ratios: bool = False,
-        suffix:str= '',
-        variable_name_map: dict[str,str]|None=None
+    suffix:str= '',
+    variable_name_map: dict[str,str]|None=None
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Run analysis for all ship types and create consolidated comparison tables.
@@ -835,8 +1094,10 @@ def run_multi_ship_comparison(
 
         try:
             # Get variables and fleet for this ship type
-            bins, features, filepath, save_dir = get_variables_func(shiptype=ship_type)
-            fleet = getting_alt_fuel_ships_func(filepath=filepath)
+            bins, features,_, filepath, save_dir,data = get_variables_func(shiptype=ship_type)
+            fleet = getting_alt_fuel_ships_func(filepath=filepath, shiptype=ship_type.string, max_build_year=max_build_year,
+                                                fuel_type_columns=fuel_type_columns,
+                                                alt_fuels=alt_fuels, conventional_fuels=conventional_fuels)
 
             # Add to feature set
             all_features_set.update(features)
@@ -846,13 +1107,12 @@ def run_multi_ship_comparison(
             if mann_whitney:
                 print(f"Running Mann-Whitney tests...")
                 mw_results = collect_mann_whitney_results(
-                    fleet=fleet,
-                    ship_type=ship_type,
-                    features=features,
+                    fleet=fleet, ship_type=ship_type, features=features,
                     matching_parameter=matching_parameter,
                     n_matches_per_ship=n_matches_per_ship,
                     use_ratios=use_ratios,
                     conventional_type=conventional_type,
+                    alternative_datasets=alternative_datasets
                 )
                 all_mw_results.append(mw_results)
 
@@ -861,13 +1121,9 @@ def run_multi_ship_comparison(
             if bootstrap:
                 print(f"Running Bootstrap CI tests...")
                 boot_results = collect_bootstrap_results(
-                    fleet=fleet,
-                    ship_type=ship_type,
-                    features=features,
-                    matching_parameter=matching_parameter,
-                    n_matches_per_ship=n_matches_per_ship,
-                    use_ratios=use_ratios,
-                    conventional_type=conventional_type,
+                    fleet=fleet, ship_type=ship_type, features=features,
+                    matching_parameter=matching_parameter, n_matches_per_ship=n_matches_per_ship,
+                    use_ratios=use_ratios, conventional_type=conventional_type, alternative_datasets=alternative_datasets
                 )
                 all_boot_results.append(boot_results)
 
@@ -914,6 +1170,7 @@ def run_multi_ship_comparison(
         mw_table = create_mann_whitney_comparison_table(
             all_results=combined_mw,
             all_features=all_features,
+            alternative_datasets=alternative_datasets,
             ship_types=ship_types,
             conventional_type=conventional_type,
             output_file=str(output_path / f'mann_whitney_comparison_table{end}_{conventional_type}_{suffix}.tex'),
@@ -922,23 +1179,45 @@ def run_multi_ship_comparison(
 
     if bootstrap:
 
-        boot_mean_table = create_bootstrap_mean_comparison_table(
-            all_results=combined_boot,
-            all_features=all_features,
-            ship_types=ship_types,
-            conventional_type=conventional_type,
-            output_file=str(output_path / f'bootstrap_mean_comparison_table{end}_{conventional_type}_{suffix}.tex'),
-            variable_name_map=variable_name_map  # Can be passed as parameter if needed
-        )
+        if combined_bootstrap_table:
+            boot_combined_table = create_bootstrap_combined_comparison_table(
+                all_results=combined_boot,
+                alternative_datasets=alternative_datasets,
+                all_features=all_features,
+                ship_types=ship_types,
+                conventional_type=conventional_type,
+                output_file=str(
+                    output_path
+                    / f'bootstrap_combined_comparison_table{end}_{conventional_type}_{suffix}.tex'
+                ),
+                variable_name_map=variable_name_map,
+                label_suffix=f'{end}_{suffix}',
+                verbose=False,
+            )
+        else:
+            boot_mean_table = create_bootstrap_mean_comparison_table(
+                all_results=combined_boot,
+                all_features=all_features,
+                ship_types=ship_types,
+                conventional_type=conventional_type,
+                output_file=str(
+                    output_path
+                    / f'bootstrap_mean_comparison_table{end}_{conventional_type}_{suffix}.tex'
+                ),
+                variable_name_map=variable_name_map
+            )
 
-        boot_median_table = create_bootstrap_median_comparison_table(
-            all_results=combined_boot,
-            all_features=all_features,
-            ship_types=ship_types,
-            conventional_type=conventional_type,
-            output_file=str(output_path / f'bootstrap_median_comparison_table{end}_{conventional_type}_{suffix}.tex'),
-            variable_name_map=variable_name_map  # Can be passed as parameter if needed
-        )
+            boot_median_table = create_bootstrap_median_comparison_table(
+                all_results=combined_boot,
+                all_features=all_features,
+                ship_types=ship_types,
+                conventional_type=conventional_type,
+                output_file=str(
+                    output_path
+                    / f'bootstrap_median_comparison_table{end}_{conventional_type}_{suffix}.tex'
+                ),
+                variable_name_map=variable_name_map
+            )
 
     print(f"\n{'=' * 80}")
     print("MULTI-SHIP COMPARISON COMPLETE")

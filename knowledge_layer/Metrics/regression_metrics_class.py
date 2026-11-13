@@ -5,9 +5,9 @@ from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 from knowledge_layer.Metrics.regression_assumption_checks import RegressionAssumptionMetrics
 from knowledge_layer.Metrics.regression_performance_metrics import RegressionPerformanceMetrics
 from knowledge_layer.Metrics.regression_selection_metrics import RegressionSelectionMetrics
+from config.loggermixin.logger_config import LoggerMixin
 
-
-class RegressionMetrics:
+class RegressionMetrics(LoggerMixin):
     """
     Central interface for regression model evaluation.
 
@@ -59,7 +59,9 @@ class RegressionMetrics:
         self,
         y_true: pd.Series,
         y_pred: pd.Series,
-    ):
+        reference:float|None=None,
+        verbose:bool=False,
+        debug:bool=False):
         """
         Initialise RegressionMetrics object.
 
@@ -77,6 +79,9 @@ class RegressionMetrics:
         self.y_true = y_true
         self.y_pred = y_pred
         self.residuals = (y_true - y_pred)
+        self.reference = reference
+        self.verbose = verbose
+        self.set_log_level(verbose=self.verbose, debug=debug)
 
     def calculate_rrmse(self, y_mean: float | None = None) -> float:
         """
@@ -91,7 +96,34 @@ class RegressionMetrics:
         :return: Relative RMSE in percentage
         :rtype: float
         """
-        return self.performance.calculate_nrmse(normalisation_variable=y_mean)
+
+        if self.reference is not None:
+            if self.verbose:
+                self.logger.info(f"Using global reference value: {self.reference}")
+            return self.performance.calculate_nrmse(normalisation_variable=self.reference)
+        else:
+            return self.performance.calculate_nrmse(normalisation_variable=y_mean)
+
+    def calculate_nmae(self, y_mean: float | None = None) -> float:
+        """
+        Calculate normalised mean absolute error
+
+        NMAE is the mean absolute error normalised by a specified normalisation variable
+        and expressed as a percentage.
+
+        :param y_mean: Optional mean value used for normalisation
+        :type y_mean: float or None
+
+        :return: Relative MAE in percentage
+        :rtype: float
+        """
+
+        if self.reference is not None:
+            if self.verbose:
+                self.logger.info(f"Using global reference value: {self.reference}")
+            return self.performance.calculate_nmae(normalisation_variable=self.reference)
+        else:
+            return self.performance.calculate_nmae(normalisation_variable=y_mean)
 
     def calculate_mape(self) -> float:
         """
@@ -203,6 +235,28 @@ class RegressionMetrics:
             "n_features": n_features,
         }
 
+    def calculate_cv_metrics(self, reference_variance: float | None = None, reference_mean:float=None) -> dict:
+        """
+        Metrics appropriate for out-of-fold predictions.
+
+        Excludes adjusted R-squared, AIC, BIC and log-likelihood: all four are
+        in-sample selection criteria whose derivations assume residuals from
+        the data the model was fitted on. Use
+        :meth:`calculate_information_criteria` for model selection on a full
+        cohort instead.
+
+        :returns dict with keys: q2, rmse, rrmse, mae, nmae, mape, n_samples
+        """
+        return {
+            "q2": self.performance.calculate_predictive_r2(reference_variance),
+            "rmse": np.sqrt(mean_squared_error(self.y_true, self.y_pred)),
+            "rrmse": self.calculate_rrmse(y_mean=reference_mean),
+            "mae": mean_absolute_error(self.y_true, self.y_pred),
+            "nmae": self.calculate_nmae(),
+            "mape": self.performance.calculate_mape(),
+            "n_samples": len(self.y_true),
+        }
+
     def calculate_information_criteria(self, n_features: int) -> dict:
         """
         Calculate model selection criteria.
@@ -269,6 +323,34 @@ class RegressionMetrics:
             feature_names=feature_names,
             vif_threshold=vif_threshold,
         )
+
+    def combined_heteroscedasticity_test(
+        self,
+        X: np.ndarray,
+        feature_names: list[str] | tuple,
+    ) -> dict:
+
+        """
+        Combined heteroscedasticity test
+        :param X:
+        :param feature_names:
+        :return:
+        """
+
+        results = {}
+
+        # results['spearman'] = self.calculate_spearman_heteroscedasticity(X=X, feature_names=feature_names)['overall']['heteroscedastic']
+        # results['breusch_pagan'] = self.breusch_pagan_test(X=X, feature_names=feature_names)['heteroscedastic']
+        # results['white'] = self.white_test(X=X, feature_names=feature_names)['heteroscedastic']
+
+        results['spearman'] = self.calculate_spearman_heteroscedasticity(X=X, feature_names=feature_names)
+        results['breusch_pagan'] = self.breusch_pagan_test(X=X, feature_names=feature_names)
+        results['white'] = self.white_test(X=X, feature_names=feature_names)
+
+        results["conclusion"] = sum(results['spearman']['overall']['heteroscedastic'], results['spearman']['heteroscedastic'], results['white']['heteroscedastic'])
+
+        return results
+
 
     def calculate_spearman_heteroscedasticity(
         self,

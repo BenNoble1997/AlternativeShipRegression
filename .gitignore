@@ -1,5 +1,12 @@
-*.txt
-*.xlsx
+DT4GS_code/*
 *.csv
+*.xlsx
+*.pdf
+*.html
+*.pkl
+*.pl
 *.png
-knowledge_layer\__pycache__\*
+MISC/
+*__pycache__/
+*.tex
+

@@ -16,7 +16,8 @@ from knowledge_layer.multi_dataset_analysers.parametric_analysis_foundation impo
 from knowledge_layer.multi_dataset_analysers.small_dataset_evaluation import SmallDatasetEvaluator
 from knowledge_layer.parametric_regression.parametric_regression_model_factory_class import ModelFactory
 from knowledge_layer.Metrics.regression_metrics_class import RegressionMetrics
-
+from knowledge_layer.multi_dataset_analysers.cross_dataset.ScaleReference import ScaleReference
+from knowledge_layer.fleet_data_class.temporal_eligibility import TemporalEligibility
 
 class CrossDatasetPerformanceAnalyzer:
     """
@@ -40,24 +41,45 @@ class CrossDatasetPerformanceAnalyzer:
     def __init__(self,
                  conventional_data: pd.DataFrame,
                  alternative_data: pd.DataFrame,
-                 independent_variables: List[str],
-                 dependent_variables: Optional[List[str]] = None,
+                 independent_variables: list[str],
+                 dependent_variables: list[str]|None = None,
                  parametric_selector: 'ParametricModelSelector' = None,
-                 model_recommendations: Optional[Dict] = None,
-                 detailed_results: Optional[Dict] = None,
-                 selection_metric: str = 'adj_r2',
+                 model_recommendations: dict|None = None,
+                 detailed_results: dict|None = None,
+                 selection_metric: str = 'rrmse',
                  selection_strategy: str = 'simple',
+                 target_predictor_constraints: dict[str, list[str]] | None = None,
                  random_state: int = 42,
-                 verbose: bool = True):
-        """Initialize analyzer with foundation and evaluator."""
+                scale_reference:ScaleReference|None=None,
+                 verbose: bool = True,
+                 build_year_col:str|None=None,
+                 year_edges:list|None=None,
+                 build_eligibility:TemporalEligibility|None=None,
+                 include_matched:bool=False):
+        """Initialize analyzer with foundation and evaluator.
 
-        # Extract from selector if provided
+        :param target_predictor_constraints: Allowed predictors per target, forwarded
+        to the foundation so that candidate filtering matches Experiment 2.
+    """
+
+        # Extract structure from the selector, but NOT the predictor-set metric.
+        #
+        # The selector's own `selection_metric` governs the model-FORM decision
+        # (which functional form wins within a fixed predictor set), where every
+        # candidate shares the same rows and AIC/BIC is comparable. It must not
+        # govern the predictor-SET decision made here, where candidates are
+        # fitted to different complete-case subsets and information criteria
+        # reward missingness. That metric stays under the caller's control.
         if parametric_selector is not None:
             model_recommendations = parametric_selector.model_recommendations
             detailed_results = parametric_selector.detailed_results
-            selection_metric = parametric_selector.selection_metric
             selection_strategy = parametric_selector.model_selector.selection_strategy
             self.model_descriptors = parametric_selector.model_descriptors
+
+            if verbose:
+                print(f"  Model forms selected under "
+                      f"'{parametric_selector.selection_metric}' (from selector); "
+                      f"predictor sets ranked by '{selection_metric}' (from caller)")
         else:
             self.model_descriptors = {}
 
@@ -71,8 +93,13 @@ class CrossDatasetPerformanceAnalyzer:
             detailed_results=detailed_results,
             selection_metric=selection_metric,
             selection_strategy=selection_strategy,
+            target_predictor_constraints=target_predictor_constraints,
             random_state=random_state,
-            verbose=verbose
+            verbose=verbose,
+            defer_matched_sets=not include_matched,
+            build_year_col=build_year_col,
+            year_edges=year_edges,
+            build_eligibility=build_eligibility
         )
 
         # Evaluator for multiple evaluation strategies
@@ -81,6 +108,9 @@ class CrossDatasetPerformanceAnalyzer:
             verbose=verbose
         )
 
+        self.include_matched=include_matched
+
+        self.scale_reference = scale_reference
         self.random_state = random_state
         self.verbose = verbose
 
@@ -244,7 +274,8 @@ class CrossDatasetPerformanceAnalyzer:
                 evaluation_method=evaluation_method,
                 n_folds=n_folds,
                 n_repeats=n_repeats,
-                n_bootstraps=n_bootstraps
+                n_bootstraps=n_bootstraps,
+                include_matched=self.include_matched,
             )
 
             if result is not None:
@@ -272,9 +303,9 @@ class CrossDatasetPerformanceAnalyzer:
         column_order = [
             'target', 'predictor_str', 'predictors', 'n_predictors', 'model_type',
             'evaluation_method',
-            'conv_r2', 'conv_r2_std',
-            'matched_r2', 'matched_r2_std',
-            'alt_r2', 'alt_r2_std',
+            'conv_q2', 'conv_q2_std',
+            'matched_q2', 'matched_q2_std',
+            'alt_q2', 'alt_q2_std',
             'conv_rrmse', 'conv_rrmse_std',
             'matched_rrmse', 'matched_rrmse_std',
             'alt_rrmse', 'alt_rrmse_std',
@@ -282,10 +313,11 @@ class CrossDatasetPerformanceAnalyzer:
 
         if evaluation_method == 'bootstrap':
             bootstrap_cols = [
-                'conv_r2_oob', 'conv_r2_train', 'conv_r2_relative_overfitting',
-                'matched_r2_oob', 'matched_r2_train', 'matched_r2_relative_overfitting',
-                'alt_r2_oob', 'alt_r2_train', 'alt_r2_relative_overfitting',
-            ]
+                                 f'{prefix}_{metric}_{part}'
+                                 for prefix in ('conv', 'matched', 'alt')
+                                 for metric in ('q2', 'adj_q2', 'rrmse')
+                                 for part in ('train', 'oob')
+                             ] + [f'{prefix}_relative_overfitting' for prefix in ('conv', 'matched', 'alt')]
             column_order.extend(bootstrap_cols)
 
         column_order.extend(['conv_n', 'matched_n', 'alt_n'])
@@ -317,23 +349,23 @@ class CrossDatasetPerformanceAnalyzer:
                                              evaluation_method: str,
                                              n_folds: int,
                                              n_repeats: int,
-                                             n_bootstraps: int) -> Optional[Dict]:
+                                             n_bootstraps: int,
+                                             include_matched:bool) -> Optional[Dict]:
         """Evaluate on three datasets using selected method."""
         # Get matched dataset
-        predictor_key = tuple(predictors)
-        matched_dataset = self.foundation.get_matched_dataset(predictor_key)
+        datasets = {'conv': self.conventional_full}
 
-        if matched_dataset is None:
-            if self.verbose:
-                print(f"    ⚠️  No matched dataset for {predictors}")
-            return None
+        if self.include_matched:
+            matched_dataset = self.foundation.get_matched_dataset(tuple(predictors))
 
-        # Prepare datasets
-        datasets = {
-            'conv': self.conventional_full,
-            'matched': matched_dataset,
-            'alt': self.alternative
-        }
+            if matched_dataset is None:
+                if self.verbose:
+                    print(f"    ⚠️  No matched dataset for {predictors}")
+                return None
+
+            datasets['matched'] = matched_dataset
+
+        datasets['alt'] = self.alternative
 
         results = {}
         failed_datasets = []  # ✅ Track failures
@@ -365,7 +397,7 @@ class CrossDatasetPerformanceAnalyzer:
             # Flatten with dataset prefix
             for metric, value in dataset_results.items():
                 if metric == 'relative_overfitting':
-                    results[f'{dataset_name}_r2_{metric}'] = value
+                    results[f'{dataset_name}_q_{metric}'] = value
                 else:
                     results[f'{dataset_name}_{metric}'] = value
 
@@ -380,8 +412,14 @@ class CrossDatasetPerformanceAnalyzer:
                              evaluation_method: str,
                              n_folds: int,
                              n_repeats: int,
-                             n_bootstraps: int) -> Optional[Dict]:
-        """Evaluate using selected evaluation strategy."""
+                             n_bootstraps: int,
+                             debug:bool=False) -> Optional[Dict]:
+        """
+        Evaluate one model on one cohort using the selected strategy.
+
+        :param debug: Emit the resolved reference scale and divisor provenance.
+        :returns: Metric dictionary, or ``None`` if the cohort has no usable data.
+        """
         # Prepare data
         data_prep = self.foundation.prepare_dataset(dataset, predictors, target)
 
@@ -392,6 +430,22 @@ class CrossDatasetPerformanceAnalyzer:
 
         X, y = data_prep
         n_samples = len(X)
+
+        reference_scale = (
+            None if self.scale_reference is None
+            else self.scale_reference.for_target(target)
+        )
+
+        if debug:
+            local_mean = float(np.mean(y))
+            if reference_scale is None:
+                print(f"      [scale] {dataset_name}/{target}: cohort-local "
+                      f"divisor={local_mean:.3f}")
+            else:
+                ratio = local_mean / reference_scale
+                print(f"      [scale] {dataset_name}/{target}: fixed "
+                      f"divisor={reference_scale:.3f}, cohort mean={local_mean:.3f} "
+                      f"(ratio {ratio:.3f})")
 
         if self.verbose:
             print(f"    {dataset_name}: {evaluation_method} (n={n_samples})")
@@ -413,7 +467,8 @@ class CrossDatasetPerformanceAnalyzer:
                 evaluation_method=evaluation_method,
                 n_folds=n_folds,
                 n_repeats=n_repeats,
-                n_bootstraps=n_bootstraps
+                n_bootstraps=n_bootstraps,
+                reference_scale=reference_scale
             )
         else:
             result = self._evaluate_standard(
@@ -421,7 +476,8 @@ class CrossDatasetPerformanceAnalyzer:
                 evaluation_method=evaluation_method,
                 n_folds=n_folds,
                 n_repeats=n_repeats,
-                n_bootstraps=n_bootstraps
+                n_bootstraps=n_bootstraps,
+                reference_scale=reference_scale
             )
 
         if result is None:
@@ -429,6 +485,7 @@ class CrossDatasetPerformanceAnalyzer:
 
         # Add sample size
         result['n'] = n_samples
+        result['reference_scale'] = reference_scale
 
         # Standardize output format
         if evaluation_method == 'bootstrap':
@@ -442,8 +499,8 @@ class CrossDatasetPerformanceAnalyzer:
             result = standardized
 
         if self.verbose:
-            r2_val = result.get('r2', np.nan)
-            r2_std = result.get('r2_std', 0)
+            r2_val = result.get('q2', np.nan)
+            r2_std = result.get('q2_std', 0)
             rrmse_val = result.get('rrmse', np.nan)
             rrmse_std = result.get('rrmse_std', 0)
 
@@ -463,14 +520,15 @@ class CrossDatasetPerformanceAnalyzer:
                                        evaluation_method: str,
                                        n_folds: int,
                                        n_repeats: int,
-                                       n_bootstraps: int) -> Optional[Dict]:
+                                       n_bootstraps: int,
+                                       reference_scale:float|None) -> dict|None:
         """Evaluate structure-discovering model with FIXED structure."""
         if evaluation_method == 'standard-cv':
-            return self._fixed_structure_standard_cv(X, y, descriptor, n_folds)
+            return self._fixed_structure_standard_cv(X, y, descriptor, n_folds, reference_scale=reference_scale)
         elif evaluation_method == 'repeated-cv':
-            return self._fixed_structure_repeated_cv(X, y, descriptor, n_folds, n_repeats)
+            return self._fixed_structure_repeated_cv(X, y, descriptor, n_folds, n_repeats, reference_scale=reference_scale)
         elif evaluation_method == 'bootstrap':
-            return self._fixed_structure_bootstrap(X, y, descriptor, n_bootstraps)
+            return self._fixed_structure_bootstrap(X, y, descriptor, n_bootstraps, reference_scale=reference_scale)
         else:
             raise ValueError(f"Unknown evaluation method: {evaluation_method}")
 
@@ -478,69 +536,109 @@ class CrossDatasetPerformanceAnalyzer:
                                      X: np.ndarray,
                                      y: np.ndarray,
                                      descriptor: 'ModelDescriptor',
-                                     n_folds: int) -> Optional[Dict]:
-        """Standard k-fold CV with fixed structure."""
+                                     n_folds: int,
+                                     reference_scale: float | None = None,
+                                     min_coverage: float = 0.8) -> Optional[Dict]:
+        """
+        Single-partition k-fold CV with fixed structure, scored on pooled
+        out-of-fold predictions.
+
+        Each sample is held out exactly once, so the k folds together produce one
+        prediction per sample. The metric is computed once on that pooled vector.
+        No dispersion is returned: a single partition provides one estimate, and
+        the fold-to-fold spread reported previously measured how unevenly the
+        shuffle divided the cohort rather than any property of the model.
+        """
         from sklearn.model_selection import KFold
 
-        cv_metrics = []
+        n_samples = len(y)
+        oof_pred = np.full(n_samples, np.nan)
+
         kfold = KFold(n_splits=n_folds, shuffle=True, random_state=self.random_state)
 
         for train_idx, test_idx in kfold.split(X):
-            X_train, X_test = X[train_idx], X[test_idx]
-            y_train, y_test = y[train_idx], y[test_idx]
-
             try:
-                model, prep = descriptor.refit(X=X_train, y=y_train, force_structure=True)
-                y_pred = ModelFactory.predict(model, prep, X_test, descriptor.model_type)
-
-                metric_calc = RegressionMetrics(y_test, y_pred)
-                n_params = descriptor.get_effective_parameters()
-                metrics = metric_calc.calculate_predictive_metrics(n_params)
-
-                cv_metrics.append(metrics)
-
+                model, prep = descriptor.refit(X=X[train_idx], y=y[train_idx],
+                                               force_structure=True)
+                oof_pred[test_idx] = ModelFactory.predict(
+                    model, prep, X[test_idx], descriptor.model_type
+                )
             except (ValueError, RuntimeError, np.linalg.LinAlgError) as e:
                 if self.verbose:
                     print(f"      Fold failed: {e}")
                 continue
 
-        if not cv_metrics:
+        predicted = ~np.isnan(oof_pred)
+        coverage = predicted.sum() / n_samples
+
+        if coverage < min_coverage:
+            if self.verbose:
+                print(f"      Discarded: only {coverage:.0%} of samples predicted")
             return None
 
-        return self._average_cv_metrics(cv_metrics)
+        metric_calc = RegressionMetrics(y_true=y[predicted],
+                                        y_pred=oof_pred[predicted],
+                                        reference=reference_scale)
+        metrics = metric_calc.calculate_cv_metrics()
+        metrics['coverage'] = coverage
+        metrics['n_evaluations'] = 1
+
+        return metrics
 
     def _fixed_structure_repeated_cv(self,
                                      X: np.ndarray,
                                      y: np.ndarray,
                                      descriptor: 'ModelDescriptor',
                                      n_folds: int,
-                                     n_repeats: int) -> Optional[Dict]:
-        """Repeated k-fold CV with fixed structure."""
-        from sklearn.model_selection import RepeatedKFold
+                                     n_repeats: int,
+                                     reference_scale: float | None = None,
+                                     min_coverage: float = 0.8) -> Optional[Dict]:
+        """
+        Repeated k-fold CV with fixed structure, scored on pooled out-of-fold
+        predictions.
 
+        One metric set is produced per repeat, from the full out-of-fold vector of
+        that partition. The dispersion returned by :meth:`_average_cv_metrics` is
+        therefore the spread across partitions, quantifying how much the estimate
+        depends on which samples were grouped together, rather than the spread
+        across folds.
+
+        ``RepeatedKFold`` is deliberately not used: it emits all splits as a flat
+        sequence with no repeat boundary, and pooling must occur within a repeat.
+        """
+        from sklearn.model_selection import KFold
+
+        n_samples = len(y)
         cv_metrics = []
-        rkfold = RepeatedKFold(
-            n_splits=n_folds,
-            n_repeats=n_repeats,
-            random_state=self.random_state
-        )
 
-        for train_idx, test_idx in rkfold.split(X):
-            X_train, X_test = X[train_idx], X[test_idx]
-            y_train, y_test = y[train_idx], y[test_idx]
+        for repeat_idx in range(n_repeats):
+            kfold = KFold(n_splits=n_folds, shuffle=True,
+                          random_state=self.random_state + repeat_idx)
 
-            try:
-                model, prep = descriptor.refit(X_train, y_train, force_structure=True)
-                y_pred = ModelFactory.predict(model, prep, X_test, descriptor.model_type)
+            oof_pred = np.full(n_samples, np.nan)
 
-                metric_calc = RegressionMetrics(y_test, y_pred)
-                n_params = descriptor.get_effective_parameters()
-                metrics = metric_calc.calculate_predictive_metrics(n_params)
+            for train_idx, test_idx in kfold.split(X):
+                try:
+                    model, prep = descriptor.refit(X[train_idx], y[train_idx],
+                                                   force_structure=True)
+                    oof_pred[test_idx] = ModelFactory.predict(
+                        model, prep, X[test_idx], descriptor.model_type
+                    )
+                except (ValueError, RuntimeError, np.linalg.LinAlgError):
+                    continue
 
-                cv_metrics.append(metrics)
+            predicted = ~np.isnan(oof_pred)
+            coverage = predicted.sum() / n_samples
 
-            except (ValueError, RuntimeError, np.linalg.LinAlgError):
+            if coverage < min_coverage:
                 continue
+
+            metric_calc = RegressionMetrics(y_true=y[predicted],
+                                            y_pred=oof_pred[predicted],
+                                            reference=reference_scale)
+            metrics = metric_calc.calculate_cv_metrics()
+            metrics['coverage'] = coverage
+            cv_metrics.append(metrics)
 
         if not cv_metrics:
             return None
@@ -554,8 +652,21 @@ class CrossDatasetPerformanceAnalyzer:
                                    X: np.ndarray,
                                    y: np.ndarray,
                                    descriptor: 'ModelDescriptor',
-                                   n_bootstraps: int) -> Optional[Dict]:
-        """Bootstrap .632+ evaluation with fixed structure."""
+                                   n_bootstraps: int,
+                                   reference_scale:float|None=None) -> dict|None:
+        """
+        Bootstrap .632+ evaluation holding the discovered model structure fixed.
+
+        **Concept:**
+        In-bag and out-of-bag predictions are scored with the *same* divisor. With
+        cohort-local normalisation these two arms use the in-bag and out-of-bag
+        sample means respectively, so the .632+ blend combines quantities on
+        different scales — at n≈15 the two means can differ by several percent.
+        A fixed reference makes both arms commensurable.
+
+        :param reference_scale: Fixed divisor for relative error metrics.
+        :returns: .632+ corrected metrics, or ``None`` if every replicate failed.
+        """
         n_samples = len(X)
         n_params = descriptor.get_effective_parameters()
 
@@ -564,7 +675,7 @@ class CrossDatasetPerformanceAnalyzer:
 
         for i in range(n_bootstraps):
             boot_idx = np.random.choice(n_samples, size=n_samples, replace=True)
-            oob_idx = np.array([i for i in range(n_samples) if i not in boot_idx])
+            oob_idx = np.setdiff1d(np.arange(n_samples), boot_idx, assume_unique=False)
 
             if len(oob_idx) < 5:
                 continue
@@ -576,12 +687,12 @@ class CrossDatasetPerformanceAnalyzer:
                 model, prep = descriptor.refit(X_boot, y_boot, force_structure=True)
 
                 y_pred_oob = ModelFactory.predict(model, prep, X_oob, descriptor.model_type)
-                metric_calc_oob = RegressionMetrics(y_oob, y_pred_oob)
+                metric_calc_oob = RegressionMetrics(y_true=y_oob, y_pred=y_pred_oob, reference=reference_scale)
                 metrics_oob = metric_calc_oob.calculate_predictive_metrics(n_params)
                 oob_metrics.append(metrics_oob)
 
                 y_pred_train = ModelFactory.predict(model, prep, X_boot, descriptor.model_type)
-                metric_calc_train = RegressionMetrics(y_boot, y_pred_train)
+                metric_calc_train = RegressionMetrics(y_true=y_boot, y_pred=y_pred_train, reference=reference_scale)
                 metrics_train = metric_calc_train.calculate_predictive_metrics(n_params)
                 train_metrics.append(metrics_train)
 
@@ -600,14 +711,15 @@ class CrossDatasetPerformanceAnalyzer:
                            evaluation_method: str,
                            n_folds: int,
                            n_repeats: int,
-                           n_bootstraps: int) -> Optional[Dict]:
+                           n_bootstraps: int,
+                           reference_scale:float|None) -> Optional[Dict]:
         """Standard evaluation for models with fixed structure."""
         if evaluation_method == 'standard-cv':
-            return self.evaluator.standard_cv(X, y, model_type, n_folds=n_folds)
+            return self.evaluator.standard_cv(X, y, model_type, n_folds=n_folds, reference_scale=reference_scale)
         elif evaluation_method == 'repeated-cv':
-            return self.evaluator.repeated_cv(X, y, model_type, n_folds=n_folds, n_repeats=n_repeats)
+            return self.evaluator.repeated_cv(X, y, model_type, n_folds=n_folds, n_repeats=n_repeats, reference_scale=reference_scale)
         elif evaluation_method == 'bootstrap':
-            return self.evaluator.bootstrap_632_plus(X, y, model_type, n_bootstraps=n_bootstraps)
+            return self.evaluator.bootstrap_632_plus(X, y, model_type, n_bootstraps=n_bootstraps, reference_scale=reference_scale)
         else:
             raise ValueError(f"Unknown evaluation method: {evaluation_method}")
 
@@ -618,7 +730,7 @@ class CrossDatasetPerformanceAnalyzer:
     def _average_cv_metrics(self, cv_metrics: List[Dict]) -> Dict:
         """Average metrics across CV folds."""
         avg_metrics = {}
-        metric_names = ['r2', 'adj_r2', 'rrmse', 'mape', 'mae', 'rmse']
+        metric_names = ['q2',  'rrmse', 'mape', 'mae', 'rmse']
 
         for metric in metric_names:
             values = [m[metric] for m in cv_metrics if not np.isnan(m.get(metric, np.nan))]
@@ -645,7 +757,7 @@ class CrossDatasetPerformanceAnalyzer:
 
         y_perm = np.random.permutation(y)
         no_info_calc = RegressionMetrics(y, y_perm)
-        no_info_metrics = no_info_calc.calculate_all_metrics(n_params)
+        no_info_metrics = no_info_calc.calculate_cv_metrics()
         no_info_mse = no_info_metrics['rmse'] ** 2
 
         oob_mse = oob_avg['rmse'] ** 2
@@ -657,7 +769,7 @@ class CrossDatasetPerformanceAnalyzer:
         w = 0.632 / (1 - 0.368 * R)
 
         corrected = {}
-        for metric in ['r2', 'adj_r2', 'rrmse', 'mape', 'mae', 'rmse']:
+        for metric in ['q2', 'rrmse', 'mape', 'mae', 'rmse']:
             train_val = train_avg.get(metric, np.nan)
             oob_val = oob_avg.get(metric, np.nan)
 
@@ -697,7 +809,7 @@ class CrossDatasetPerformanceAnalyzer:
 
         print("=" * 160)
 
-        high_variance_targets = results_df[results_df['alt_r2_std'] > 0.3]['target'].tolist()
+        high_variance_targets = results_df[results_df['alt_q2_std'] > 0.3]['target'].tolist()
         if high_variance_targets:
             print(f"\n⚠️  High variance on alternative dataset for: {', '.join(high_variance_targets)}")
             print("      This is expected given small sample size (n≈18)")
@@ -707,7 +819,8 @@ class CrossDatasetPerformanceAnalyzer:
             print()
 
         print(f"\n{'Target':<15s} | {'Predictors':<25s} | {'Model':<15s} | "
-              f"{'Conv R²':>15s} | {'Matched R²':>15s} | {'Alt R²':>15s}")
+              # f"{'Conv R²':>15s} | {'Matched R²':>15s} | {'Alt R²':>15s}")
+         f"{'Conv R²':>15s} | {'Alt R²':>15s}")
 
         if evaluation_method == 'bootstrap':
             print(f"{'':15s} | {'':25s} | {'':15s} | "
@@ -717,31 +830,31 @@ class CrossDatasetPerformanceAnalyzer:
         print("-" * 160)
 
         for _, row in results_df.iterrows():
-            conv_str = f"{row['conv_r2']:>6.3f}±{row['conv_r2_std']:>5.3f}"
-            matched_str = f"{row['matched_r2']:>6.3f}±{row['matched_r2_std']:>5.3f}"
+            conv_str = f"{row['conv_q2']:>6.3f}±{row['conv_q2_std']:>5.3f}"
+            # matched_str = f"{row['matched_q2']:>6.3f}±{row['matched_q2_std']:>5.3f}"
 
-            if row['alt_r2_std'] > 0.3:
-                alt_str = f"{row['alt_r2']:>6.3f}±{row['alt_r2_std']:>5.3f}*"
+            if row['alt_q2_std'] > 0.3:
+                alt_str = f"{row['alt_q2']:>6.3f}±{row['alt_q2_std']:>5.3f}*"
             else:
-                alt_str = f"{row['alt_r2']:>6.3f}±{row['alt_r2_std']:>5.3f} "
+                alt_str = f"{row['alt_q2']:>6.3f}±{row['alt_q2_std']:>5.3f} "
 
             print(f"{row['target']:<15s} | "
                   f"{row['predictor_str']:<25s} | "
                   f"{row['model_type']:<15s} | "
                   f"{conv_str:>15s} | "
-                  f"{matched_str:>15s} | "
+                  # f"{matched_str:>15s} | "
                   f"{alt_str:>15s}")
 
             if evaluation_method == 'bootstrap':
-                conv_decomp = f"({row.get('conv_r2_train', 0):.2f}→{row.get('conv_r2_oob', 0):.2f}→{row['conv_r2']:.2f})"
-                matched_decomp = f"({row.get('matched_r2_train', 0):.2f}→{row.get('matched_r2_oob', 0):.2f}→{row['matched_r2']:.2f})"
-                alt_decomp = f"({row.get('alt_r2_train', 0):.2f}→{row.get('alt_r2_oob', 0):.2f}→{row['alt_r2']:.2f})"
-                alt_overfit = row.get('alt_r2_relative_overfitting', 0)
+                conv_decomp = f"({row.get('conv_q2_train', 0):.2f}→{row.get('conv_rq_oob', 0):.2f}→{row['conv_q2']:.2f})"
+                # matched_decomp = f"({row.get('matched_q2_train', 0):.2f}→{row.get('matched_q2_oob', 0):.2f}→{row['matched_q2']:.2f})"
+                alt_decomp = f"({row.get('alt_q2_train', 0):.2f}→{row.get('alt_q2_oob', 0):.2f}→{row['alt_q2']:.2f})"
+                alt_overfit = row.get('alt_q2_relative_overfitting', 0)
                 overfit_marker = "⚠️" if alt_overfit > 0.5 else ""
 
                 print(f"{'':15s} | {'':25s} | {'':15s} | "
                       f"{conv_decomp:>15s} | "
-                      f"{matched_decomp:>15s} | "
+                      # f"{matched_decomp:>15s} | "
                       f"{alt_decomp:>15s} {overfit_marker}")
 
             print("=" * 160)
@@ -754,21 +867,21 @@ class CrossDatasetPerformanceAnalyzer:
             print("\nSUMMARY:")
             print(f"  Dataset sizes (mean):")
             print(f"    Conventional:  n={results_df['conv_n'].iloc[0]:.0f}")
-            print(f"    Matched:       n={results_df['matched_n'].mean():.0f}")
+            # print(f"    Matched:       n={results_df['matched_n'].mean():.0f}")
             print(f"    Alternative:   n={results_df['alt_n'].mean():.0f}")
 
             print(f"\n  Mean performance:")
-            print(f"    Conventional R²:  {results_df['conv_r2'].mean():.3f} "
-                  f"(mean std: {results_df['conv_r2_std'].mean():.3f})")
-            print(f"    Matched R²:       {results_df['matched_r2'].mean():.3f} "
-                  f"(mean std: {results_df['matched_r2_std'].mean():.3f})")
-            print(f"    Alternative R²:   {results_df['alt_r2'].mean():.3f} "
-                  f"(mean std: {results_df['alt_r2_std'].mean():.3f})")
+            print(f"    Conventional R²:  {results_df['conv_q2'].mean():.3f} "
+                  f"(mean std: {results_df['conv_q2_std'].mean():.3f})")
+            # print(f"    Matched R²:       {results_df['matched_q2'].mean():.3f} "
+            #       f"(mean std: {results_df['matched_q2_std'].mean():.3f})")
+            print(f"    Alternative R²:   {results_df['alt_q2'].mean():.3f} "
+                  f"(mean std: {results_df['alt_q2_std'].mean():.3f})")
 
             if evaluation_method == 'bootstrap':
                 print(f"\n  Overfitting analysis (alternative dataset):")
-                avg_overfit = results_df['alt_r2_relative_overfitting'].mean()
-                severe_overfit = (results_df['alt_r2_relative_overfitting'] > 0.5).sum()
+                avg_overfit = results_df['alt_q2_relative_overfitting'].mean()
+                severe_overfit = (results_df['alt_q2_relative_overfitting'] > 0.5).sum()
 
                 print(f"    Mean relative overfitting (R): {avg_overfit:.2f}")
                 print(f"    Targets with severe overfitting (R>0.5): {severe_overfit}/{len(results_df)}")
@@ -780,7 +893,7 @@ class CrossDatasetPerformanceAnalyzer:
             if 'conv_n_evaluations' in results_df.columns:
                 print(f"\n  Evaluation completeness:")
                 print(f"    Conventional:  {results_df['conv_n_evaluations'].mean():.0f} evaluations")
-                print(f"    Matched:       {results_df['matched_n_evaluations'].mean():.0f} evaluations")
+                # print(f"    Matched:       {results_df['matched_n_evaluations'].mean():.0f} evaluations")
                 print(f"    Alternative:   {results_df['alt_n_evaluations'].mean():.0f} evaluations")
 
             print("=" * 160)

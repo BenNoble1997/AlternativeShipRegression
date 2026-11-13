@@ -4,7 +4,7 @@ import pandas as pd
 import ast
 
 from knowledge_layer.literature_regressions.literature_formulas_class import LiteratureFormula
-from Operational_profile.data_processing.file_import_class import DataImporter
+from data_processing.file_import_class import DataImporter
 
 
 # ============================================================================

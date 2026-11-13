@@ -32,7 +32,7 @@ import warnings
 from sklearn.ensemble import RandomForestRegressor
 from knowledge_layer.Metrics.regression_metrics_class import RegressionMetrics
 from knowledge_layer.multi_dataset_analysers.rf_analysis_foundation import RandomForestAnalysisFoundation
-from config import LoggerMixin
+from config.loggermixin.logger_config import LoggerMixin
 
 warnings.filterwarnings('ignore')
 

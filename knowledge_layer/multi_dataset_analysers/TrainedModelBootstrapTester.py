@@ -348,8 +348,10 @@ class TrainedModelBootstrapTester:
                        y: np.ndarray,
                        reference_mean: float) -> float:
         try:
-            y_pred = predict_fn(X)
-            return RegressionMetrics(y_pred, y).calculate_rrmse(y_mean=reference_mean)
+            y_pred = np.asarray(predict_fn(X), dtype=float)
+            if not np.isfinite(y_pred).all():
+                return np.nan
+            return RegressionMetrics(y, y_pred).calculate_rrmse(y_mean=reference_mean)
         except Exception:
             return np.nan
 
@@ -400,38 +402,55 @@ class TrainedModelBootstrapTester:
                        debug: bool = False) -> np.ndarray:
         """
         Vectorised bootstrap: precompute per-observation squared errors once,
-        then resample those errors entirely in NumPy — no repeated predict calls.
+        then resample those errors entirely in NumPy.
 
-        Why this works
-        --------------
-        The model is fixed, so y_pred[i] is constant for any given observation i
-        regardless of which bootstrap sample it appears in. Squared error for row i
-        is therefore also constant: sq_err[i] = (y_true[i] - y_pred[i])^2.
+        Rows whose predictions are non-finite (NaN/inf) are dropped from the
+        squared-error tables before resampling, and a warning is emitted.
+        If fewer than 3 finite rows remain in either set, an all-NaN delta
+        array is returned so the caller can flag the result as invalid.
 
-        RRMSE on a bootstrap resample is just the mean of sq_err over the selected
-        indices, which is a pure NumPy indexing + averaging operation.
-
-        Memory
-        ------
-        Index matrices are (n_bootstrap, n_a) and (n_bootstrap, n_b) int64 arrays.
-        At n_bootstrap=5000, n_a=174, n_b=25: ~7 MB + ~1 MB — negligible.
-        At n_bootstrap=50000: ~70 MB + ~10 MB — still fine for typical datasets.
-        If n is very large (>5000 ships) consider chunking (see note below).
+        :param predict_fn: Trained model prediction function.
+        :type predict_fn: Callable
+        :param X_a: Features for evaluation set A.
+        :type X_a: np.ndarray
+        :param y_a: Targets for evaluation set A.
+        :type y_a: np.ndarray
+        :param X_b: Features for evaluation set B.
+        :type X_b: np.ndarray
+        :param y_b: Targets for evaluation set B.
+        :type y_b: np.ndarray
+        :param reference_mean: Conventional target mean for RRMSE normalisation.
+        :type reference_mean: float
+        :param debug: Print step-by-step progress.
+        :type debug: bool
+        :returns: Bootstrap distribution of the RRMSE delta (B − A).
+        :rtype: np.ndarray
         """
-        # ── Step 1: Precompute squared errors — 2 predict calls total ──────────
         try:
-            y_pred_a = predict_fn(X_a)  # shape (n_a,)
-            y_pred_b = predict_fn(X_b)  # shape (n_b,)
+            y_pred_a = predict_fn(X_a)
+            y_pred_b = predict_fn(X_b)
         except Exception:
-            # Fall back to original loop-based method if prediction fails
             return self._run_bootstrap_loop(
                 predict_fn, X_a, y_a, X_b, y_b, reference_mean, debug
             )
 
-        sq_err_a = (y_a - y_pred_a) ** 2  # shape (n_a,)
-        sq_err_b = (y_b - y_pred_b) ** 2  # shape (n_b,)
+        sq_err_a = (y_a - np.asarray(y_pred_a, dtype=float)) ** 2
+        sq_err_b = (y_b - np.asarray(y_pred_b, dtype=float)) ** 2
 
-        n_a, n_b = len(y_a), len(y_b)
+        # ── Guard: drop rows with non-finite predictions ────────────────────────
+        finite_a = np.isfinite(sq_err_a)
+        finite_b = np.isfinite(sq_err_b)
+
+        if not finite_a.all() or not finite_b.all():
+            n_bad = int((~finite_a).sum() + (~finite_b).sum())
+            print(f"  ⚠️  {n_bad} non-finite prediction(s) dropped from bootstrap "
+                  f"(A: {(~finite_a).sum()}, B: {(~finite_b).sum()})")
+            sq_err_a = sq_err_a[finite_a]
+            sq_err_b = sq_err_b[finite_b]
+
+        n_a, n_b = len(sq_err_a), len(sq_err_b)
+        if n_a < 3 or n_b < 3:
+            return np.full(self.n_bootstrap, np.nan)
 
         if debug:
             obs_rrmse_a = np.sqrt(sq_err_a.mean()) / reference_mean * 100
@@ -439,22 +458,15 @@ class TrainedModelBootstrapTester:
             print(f"  [Vectorised] Precomputed sq errors: "
                   f"RRMSE_A={obs_rrmse_a:.3f}%, RRMSE_B={obs_rrmse_b:.3f}%")
 
-        # ── Step 2: Generate ALL bootstrap index matrices at once ───────────────
-        # idx_a_all shape: (n_bootstrap, n_a) — each row is one resample of A
-        # idx_b_all shape: (n_bootstrap, n_b) — each row is one resample of B
         idx_a_all = np.random.choice(n_a, size=(self.n_bootstrap, n_a), replace=True)
         idx_b_all = np.random.choice(n_b, size=(self.n_bootstrap, n_b), replace=True)
 
-        # ── Step 3: Index into squared error lookup tables ──────────────────────
-        # sq_err_a[idx_a_all] shape: (n_bootstrap, n_a)
-        # .mean(axis=1)        shape: (n_bootstrap,)  — one MSE per resample
-        mse_a = sq_err_a[idx_a_all].mean(axis=1)  # shape (n_bootstrap,)
-        mse_b = sq_err_b[idx_b_all].mean(axis=1)  # shape (n_bootstrap,)
+        mse_a = sq_err_a[idx_a_all].mean(axis=1)
+        mse_b = sq_err_b[idx_b_all].mean(axis=1)
 
-        # ── Step 4: Convert to RRMSE and compute deltas ─────────────────────────
-        rrmse_a = np.sqrt(mse_a) / reference_mean * 100  # shape (n_bootstrap,)
-        rrmse_b = np.sqrt(mse_b) / reference_mean * 100  # shape (n_bootstrap,)
-        deltas = rrmse_b - rrmse_a  # shape (n_bootstrap,)
+        rrmse_a = np.sqrt(mse_a) / reference_mean * 100
+        rrmse_b = np.sqrt(mse_b) / reference_mean * 100
+        deltas = rrmse_b - rrmse_a
 
         if debug:
             print(f"  [Vectorised] Bootstrap delta: "

@@ -90,7 +90,7 @@ Data Flow
 
 from dataclasses import dataclass, field
 from math import comb
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, ClassVar
 
 import json
 import numpy as np
@@ -191,6 +191,8 @@ class ModelDescriptor:
     :type metadata: dict[str, Any]
     """
 
+
+
     # =========================================================================
     # Core Identity
     # =========================================================================
@@ -235,6 +237,30 @@ class ModelDescriptor:
     fitting_date: Optional[str] = None
     notes: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+    # =========================================================================
+    # Model family constants
+    # =========================================================================
+    # ClassVar annotations are excluded from the dataclass field list, so these
+    # are shared constants rather than instance attributes.
+    #
+    # Declaring each family once prevents the literal lists from drifting apart
+    # between refit(), from_fitted_model() and _calculate_effective_df() — the
+    # same single-declaration principle applied to the fuel taxonomy.
+    #
+    # Bias-key handling is deliberately NOT duplicated here: it lives on
+    # ParametricFormulaRenderer.BIAS_KEYS, which is the single definition
+    # consumed by both the renderer and this class.
+
+    SIMPLE_NONLINEAR_TYPES: ClassVar[frozenset] = frozenset({
+        'exponential', 'exponential-offset',
+        'power', 'power-offset',
+        'logarithmic', 'logarithmic-power',
+    })
+
+    LOG_TRANSFORM_TYPES: ClassVar[frozenset] = frozenset({
+        'power-log-multivariate', 'exponential-log-multivariate',
+    })
 
     # =========================================================================
     # Initialisation
@@ -282,11 +308,20 @@ class ModelDescriptor:
         Rules applied in priority order:
 
         - **Lasso**: count of non-zero coefficients + 1 (intercept).
-        - **MFP**: 1 (intercept) + 1 per *linear* / *FP1* term + 2 per
-          *FP2* term.
-        - **Polynomial**: total expansion features via combinatorial
-          formula.
+        - **MFP**: 1 (intercept) + 1 per *linear* / *FP1* term + 2 per *FP2*
+          term.
+        - **Polynomial**: total expansion features via combinatorial formula.
+        - **Simple nonlinear**: actual fitted parameter count — 2 for
+          ``power`` / ``exponential`` / ``logarithmic`` / ``logarithmic-power``,
+          3 for the ``-offset`` variants.  These carry no separate intercept,
+          so the previous ``len(independent_vars) + 1`` rule undercounted every
+          offset model by one parameter and inflated its adjusted R².
+        - **Log-transform multivariate**: one exponent per predictor plus the
+          multiplicative constant.
         - **Linear / Ridge / other**: ``len(independent_vars) + 1``.
+
+        Called from :meth:`__post_init__`, where :attr:`coefficients` may not
+        yet be populated — hence the structural fallback per family.
 
         :returns: Effective number of free parameters.
         :rtype: int
@@ -315,6 +350,15 @@ class ModelDescriptor:
                 comb(n_input + d - 1, d)
                 for d in range(self.polynomial_degree + 1)
             )
+
+        if self.model_type in self.SIMPLE_NONLINEAR_TYPES:
+            if self.coefficients:
+                return len([n for n in self.coefficients
+                            if n not in ParametricFormulaRenderer.BIAS_KEYS])
+            return 3 if self.model_type.endswith('-offset') else 2
+
+        if self.model_type in self.LOG_TRANSFORM_TYPES:
+            return len(self.independent_vars) + 1  # exponents + multiplicative a
 
         return len(self.independent_vars) + 1
 
@@ -395,33 +439,59 @@ class ModelDescriptor:
         Return descriptive names for each coefficient in the model.
 
         Names reflect actual transformations, e.g.
-        ``['intercept', '√DWT', '1/GT', 'GT²']`` for an MFP model.
+        ``['intercept', '√DWT', '1/GT', 'GT²']`` for an MFP model, and are
+        guaranteed to be the same strings used as keys in :attr:`coefficients`
+        — so callers can join on them safely.
+
+        For :attr:`SIMPLE_NONLINEAR_TYPES` and :attr:`LOG_TRANSFORM_TYPES` the
+        names are now read from the stored coefficients (``['a', 'b']``,
+        ``['intercept', 'b_0_DWT']``).  The previous implementation returned
+        :attr:`independent_vars` for these families, which never matched the
+        stored keys — a ``power`` model reported ``['DWT']`` while its
+        coefficients were keyed ``'a'`` and ``'b'``.
+
+        The returned order matches :meth:`get_beta_index_map`.
 
         :param only_active: For Lasso, suppress zero-coefficient features.
         :type only_active: bool
 
-        :returns: Ordered list of coefficient names starting with
-            ``'intercept'``.
+        :returns: Ordered list of coefficient names.
         :rtype: list[str]
         """
         if self.model_type == 'mfp':
             return self._get_mfp_coefficient_names()
-        elif self.model_type.startswith('polynomial'):
+
+        if self.model_type.startswith('polynomial'):
             return self._get_polynomial_coefficient_names(only_active)
-        else:
+
+        if self.model_type in (self.SIMPLE_NONLINEAR_TYPES | self.LOG_TRANSFORM_TYPES):
             names = ['intercept'] if self.intercept is not None else []
-            if only_active and self.regularization_type == 'lasso':
-                if self.active_features:
-                    names.extend(self.active_features)
-                else:
-                    names.extend([
-                        v for v in self.independent_vars
-                        if self.coefficients
-                        and abs(self.coefficients.get(v, 0)) > 1e-10
-                    ])
+            names.extend(
+                n for n in (self.coefficients or {})
+                if n not in ParametricFormulaRenderer.BIAS_KEYS
+            )
+            if names:
+                return names
+            # Unfitted descriptor: fall back to structural parameter names
+            if self.model_type in self.LOG_TRANSFORM_TYPES:
+                return ['intercept'] + [
+                    f'b_{i}_{v}' for i, v in enumerate(self.independent_vars)
+                ]
+            return ['a', 'b', 'c'][:self._calculate_effective_df()]
+
+        names = ['intercept'] if self.intercept is not None else []
+        if only_active and self.regularization_type == 'lasso':
+            if self.active_features:
+                names.extend(self.active_features)
             else:
-                names.extend(self.independent_vars)
-            return names
+                names.extend([
+                    v for v in self.independent_vars
+                    if self.coefficients
+                    and abs(self.coefficients.get(v, 0)) > 1e-10
+                ])
+        else:
+            names.extend(self.independent_vars)
+        return names
 
     def _get_mfp_coefficient_names(self) -> List[str]:
         """
@@ -504,18 +574,32 @@ class ModelDescriptor:
         the model structure fixed.
 
         This is the primary method used by
-        :class:`~ParametricCrossDatasetAnalyzer` to apply a model
-        discovered on conventional ships to an alternative-fuel dataset.
+        :class:`~ParametricCrossDatasetAnalyzer` and
+        :class:`~CoefficientComparisonAnalyzer` to apply a model discovered on
+        conventional ships to a matched or alternative-fuel dataset.
 
         When ``force_structure=True``:
 
         - **MFP**: the exact ``{var_idx: (transform_type, powers)}`` mapping
           stored in :attr:`transformations` is preserved.
         - **Lasso**: :attr:`regularization_alpha` is fixed.
-        - **Nonlinear**: the same functional form is used (curve_fit
+        - **Simple nonlinear**: the same functional form is used (curve_fit
           re-optimises only the parameters).
+        - **Log-transform multivariate**: the same log-space linear model is
+          re-estimated and back-transformed.
         - **Linear / Ridge / other**: re-fitted freely via
           :meth:`~ModelFactory.create_and_fit`.
+
+        .. note::
+
+           The log-transform branch is new.  These model types previously fell
+           through to :meth:`_update_from_fitted_model`, which stored the
+           *log-space* intercept and named coefficients by bare variable name,
+           whereas :meth:`from_fitted_model` stores the *back-transformed*
+           constant under ``'b_{i}_{var}'`` keys.  A descriptor therefore
+           changed storage convention the first time it was refitted, and
+           :meth:`~ParametricFormulaRenderer.resolve_log_exponents` had nothing
+           to match against.
 
         .. warning::
 
@@ -528,16 +612,16 @@ class ModelDescriptor:
         :param y: New target vector, shape ``(n_samples,)``.
         :type y: numpy.ndarray
         :param force_structure: Preserve model structure when ``True``
-            (default).  Passing ``False`` for MFP allows fresh
-            transformation discovery (breaks coefficient comparability).
+            (default).  Passing ``False`` for MFP allows fresh transformation
+            discovery (breaks coefficient comparability).
         :type force_structure: bool
 
         :returns: ``(model, preprocessor)`` ready for use with
             :meth:`~ModelFactory.predict`.
         :rtype: tuple
 
-        :raises ValueError: If :attr:`transformations` is ``None`` when
-            MFP structure-forcing is requested.
+        :raises ValueError: If :attr:`transformations` is ``None`` when MFP
+            structure-forcing is requested.
         """
         if self.model_type == 'mfp':
             return (
@@ -547,11 +631,10 @@ class ModelDescriptor:
             )
         elif self.model_type.endswith('lasso') and force_structure:
             return self._refit_lasso_fixed_alpha(X, y)
-        elif self.model_type in [
-            'exponential', 'exponential-offset', 'power',
-            'power-offset', 'logarithmic', 'logarithmic-power',
-        ]:
+        elif self.model_type in self.SIMPLE_NONLINEAR_TYPES:
             return self._refit_nonlinear_model(X, y)
+        elif self.model_type in self.LOG_TRANSFORM_TYPES:
+            return self._refit_log_transform_model(X, y)
         else:
             from knowledge_layer.parametric_regression.parametric_model_factory import ModelFactory
             model, preprocessor = ModelFactory.create_and_fit(self.model_type, X, y)
@@ -623,17 +706,52 @@ class ModelDescriptor:
         self._update_from_fitted_mfp(mfp)
         return mfp, None
 
-    def _refit_lasso_fixed_alpha(self, X: np.ndarray, y: np.ndarray):
+    def _refit_lasso_fixed_alpha(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        preserve_active_set: bool = True,
+    ):
         """
         Refit a Lasso or polynomial-Lasso model using the stored
-        regularisation strength.
+        regularisation strength, optionally holding the active feature set fixed.
 
-        Holding alpha fixed provides a fair cross-dataset comparison.
+        Holding α fixed alone is **not** sufficient to fix the model structure.
+        Lasso re-selects which coefficients are driven to zero on every fit, so
+        a term excluded on the conventional fleet can re-enter on the
+        alternative-fuel cohort.  The two fitted models then have different
+        parameter sets, which undermines the premise of the cross-dataset
+        coefficient comparison: coefficients on correlated polynomial columns
+        shift when a neighbouring column enters or leaves, so even the shared
+        terms stop being strictly comparable.
 
-        :param X: New predictor matrix.
+        With ``preserve_active_set=True`` the fit is restricted to the columns
+        named in :attr:`active_features` — the set carried over from the
+        originally-selected model.  Excluded columns are held at exactly zero by
+        construction rather than by chance.  Because
+        :class:`~CoefficientComparisonAnalyzer` refits all three descriptors
+        (full conventional, matched conventional, alternative) from the same
+        base copy, the restriction is applied symmetrically and the comparison
+        stays like-for-like.
+
+        The penalty is retained on the restricted columns rather than switching
+        to OLS: dropping the penalty would remove the shrinkage bias from the
+        refitted cohorts while leaving it in the selected model, making the
+        magnitudes incomparable in a different way.
+
+        .. note::
+
+           The returned model is fitted on the restricted column set but has its
+           ``coef_`` scattered back to full width, so it remains usable with the
+           full polynomial expansion via :meth:`~ModelFactory.predict`.
+
+        :param X: New predictor matrix, shape ``(n_samples, n_features)``.
         :type X: numpy.ndarray
-        :param y: New target vector.
+        :param y: New target vector, shape ``(n_samples,)``.
         :type y: numpy.ndarray
+        :param preserve_active_set: Restrict the fit to :attr:`active_features`.
+            Falls back to an unrestricted fit when no active set is stored.
+        :type preserve_active_set: bool
 
         :returns: ``(model, preprocessor)``
         :rtype: tuple
@@ -646,12 +764,40 @@ class ModelDescriptor:
         if self.model_type.startswith('polynomial'):
             poly = PolynomialFeatures(degree=self.polynomial_degree)
             X_in = poly.fit_transform(X)
+            feature_names = list(poly.get_feature_names_out(self.independent_vars))
         else:
-            X_in = X
             poly = None
+            X_in = X
+            feature_names = list(self.independent_vars)
 
         model = Lasso(alpha=alpha, max_iter=5000)
-        model.fit(X_in, y)
+
+        # Capture the active set *before* _update_from_fitted_lasso overwrites it
+        stored_active = set(self.active_features) if self.active_features else None
+
+        if preserve_active_set and stored_active:
+            keep = np.array([name in stored_active for name in feature_names])
+
+            if not keep.any():
+                raise ValueError(
+                    f"Preserved active set for '{self.model_type}' matches none of "
+                    f"the expanded feature names. Stored active features: "
+                    f"{sorted(stored_active)}; expansion produced: {feature_names}. "
+                    f"This usually means the descriptor was built with a different "
+                    f"polynomial degree or predictor order than the X passed to refit()."
+                )
+
+            model.fit(X_in[:, keep], y)
+
+            # Scatter the restricted coefficients back to full width so the
+            # returned model still consumes the full polynomial expansion.
+            full_coef = np.zeros(X_in.shape[1], dtype=float)
+            full_coef[keep] = model.coef_
+            model.coef_ = full_coef
+            model.n_features_in_ = X_in.shape[1]
+        else:
+            model.fit(X_in, y)
+
         self._update_from_fitted_lasso(model, poly)
         return model, poly
 
@@ -674,6 +820,101 @@ class ModelDescriptor:
         self._update_from_nonlinear_model(model)
         return model, preprocessor
 
+    def _refit_log_transform_model(self, X: np.ndarray, y: np.ndarray):
+        """
+        Refit a log-transform multivariate model, preserving the storage
+        convention established by :meth:`from_fitted_model`.
+
+        Both supported forms are estimated as ordinary least squares in log
+        space and then back-transformed:
+
+        - ``power-log-multivariate``:
+          :math:`y = a\\,x_1^{b_1} x_2^{b_2}` fitted as
+          :math:`\\ln y = \\ln a + b_1 \\ln x_1 + b_2 \\ln x_2`
+        - ``exponential-log-multivariate``:
+          :math:`y = a\\,e^{b_1 x_1 + b_2 x_2}` fitted as
+          :math:`\\ln y = \\ln a + b_1 x_1 + b_2 x_2`
+
+        The log transformation itself is applied inside
+        :meth:`~ModelFactory.create_and_fit`; this method only re-establishes
+        the descriptor's storage contract afterwards.
+
+        :param X: New predictor matrix, shape ``(n_samples, n_features)``.
+        :type X: numpy.ndarray
+        :param y: New target vector, shape ``(n_samples,)``.
+        :type y: numpy.ndarray
+
+        :returns: ``(model, preprocessor)``
+        :rtype: tuple
+        """
+        from knowledge_layer.parametric_regression.parametric_model_factory import ModelFactory
+
+        model, preprocessor = ModelFactory.create_and_fit(self.model_type, X, y)
+        self._update_from_log_transform_model(model)
+        return model, preprocessor
+
+    def _update_from_log_transform_model(self, model) -> None:
+        """
+        Update :attr:`intercept`, :attr:`coefficients` and :attr:`metadata`
+        from a log-space linear model.
+
+        Establishes exactly the convention that
+        :meth:`~ParametricFormulaRenderer.resolve_log_exponents` searches for:
+
+        - :attr:`intercept` holds the **back-transformed multiplicative
+          constant** :math:`a = e^{\\hat\\beta_0}`, not the log-space intercept.
+        - Coefficient keys take the ``'b_{i}_{var}'`` form.
+        - The raw log-space intercept is retained under
+          ``metadata['log_intercept']`` for anyone needing the estimation-scale
+          quantity.
+
+        Storing :math:`a` rather than :math:`\\ln a` matters for cross-dataset
+        comparison: the rendered formula shows :math:`a`, so a
+        coefficient-change bar labelled β₀ must measure :math:`\\Delta a`.
+        Mixing the two scales across datasets produces a difference with no
+        interpretation.
+
+        :param model: Fitted log-space estimator, expected to expose ``coef_``
+            and ``intercept_``.
+
+        :raises ValueError: If the model exposes no coefficients, or if the
+            coefficient count does not match :attr:`independent_vars`.
+        """
+        if not hasattr(model, 'coef_') or not hasattr(model, 'intercept_'):
+            present = [a for a in ('coef_', 'intercept_') if hasattr(model, a)]
+            raise ValueError(
+                f"Log-transform refit for model_type='{self.model_type}' expected a "
+                f"fitted linear estimator exposing 'coef_' and 'intercept_', but got "
+                f"{type(model).__name__} exposing {present or 'neither'}."
+            )
+
+        coefs = np.ravel(model.coef_)
+
+        if len(coefs) != len(self.independent_vars):
+            raise ValueError(
+                f"Coefficient count mismatch for model_type='{self.model_type}': "
+                f"the fitted model has {len(coefs)} coefficients but the descriptor "
+                f"declares {len(self.independent_vars)} predictors "
+                f"({self.independent_vars}). Refusing to guess the pairing — check "
+                f"that the X passed to refit() has its columns in the same order as "
+                f"independent_vars."
+            )
+
+        log_intercept = float(model.intercept_)
+
+        self.coefficients = {
+            f'b_{i}_{var}': float(coefs[i])
+            for i, var in enumerate(self.independent_vars)
+        }
+        self.intercept = float(np.exp(log_intercept))
+
+        if self.metadata is None:
+            self.metadata = {}
+        self.metadata['log_intercept'] = log_intercept
+        self.metadata['transform_type'] = getattr(
+            model, 'transform_type_', self.metadata.get('transform_type')
+        )
+
     # =========================================================================
     # Internal Update Methods
     # =========================================================================
@@ -681,19 +922,65 @@ class ModelDescriptor:
     def _update_from_fitted_model(self, model, preprocessor):
         """
         Update :attr:`intercept` and :attr:`coefficients` from a generic
-        sklearn estimator after a plain refit.
+        sklearn estimator fitted **on the original scale**.
+
+        This is the fallback branch of :meth:`refit`, valid only for the
+        linear, ridge and polynomial families.  It now rejects the two model
+        shapes it previously mis-handled in silence:
+
+        - a ``(func_name, popt)`` tuple from
+          :class:`~UnivariateNonlinearFitter`, which has neither ``coef_`` nor
+          ``intercept_`` — so the descriptor was left holding its *previous*
+          dataset's coefficients, making every computed coefficient change
+          exactly zero;
+        - a log-space estimator, whose ``ln a`` intercept would be stored as
+          though it were ``a``.
+
+        Both are now routed by :meth:`refit` to dedicated handlers.  These
+        guards exist so a future dispatch regression fails at the point of
+        error rather than surfacing as an odd-looking figure several steps
+        downstream.
 
         :param model: Fitted sklearn estimator.
         :param preprocessor: Fitted
             :class:`~sklearn.preprocessing.PolynomialFeatures` or ``None``.
+
+        :raises ValueError: If ``model`` is a curve-fit tuple or a log-space
+            estimator, both of which require a family-specific updater.
         """
-        self.intercept = getattr(model, 'intercept_', None)
-        if hasattr(model, 'coef_'):
-            if preprocessor is not None:
-                names = preprocessor.get_feature_names_out(self.independent_vars)
-                self.coefficients = dict(zip(names, model.coef_))
-            else:
-                self.coefficients = dict(zip(self.independent_vars, model.coef_))
+        if isinstance(model, tuple):
+            raise ValueError(
+                f"_update_from_fitted_model received a curve-fit tuple for "
+                f"model_type='{self.model_type}'. Use _update_from_nonlinear_model(); "
+                f"this path cannot extract parameters from a (func_name, popt) pair."
+            )
+
+        if hasattr(model, 'transform_type_'):
+            raise ValueError(
+                f"_update_from_fitted_model received a log-space estimator for "
+                f"model_type='{self.model_type}'. Use "
+                f"_update_from_log_transform_model(), which back-transforms the "
+                f"intercept and applies the 'b_{{i}}_{{var}}' key convention."
+            )
+
+        self.intercept = (
+            float(model.intercept_)
+            if getattr(model, 'intercept_', None) is not None
+            else None
+        )
+
+        if not hasattr(model, 'coef_'):
+            return
+
+        names = (
+            preprocessor.get_feature_names_out(self.independent_vars)
+            if preprocessor is not None
+            else self.independent_vars
+        )
+        self.coefficients = {
+            str(name): float(value)
+            for name, value in zip(names, np.ravel(model.coef_))
+        }
 
     def _update_from_fitted_mfp(self, mfp):
         """
@@ -1197,6 +1484,60 @@ class ModelDescriptor:
             f"df={self.effective_df})"
         )
 
+    def get_beta_index_map(self) -> Dict[str, int]:
+        """
+        Return the canonical β index assigned to each stored coefficient.
+
+        Delegates to
+        :meth:`~ParametricFormulaRenderer.build_beta_index_map`, which holds
+        the single implementation of the ordering convention.  Exposing it here
+        gives the coefficient-change plotter a descriptor-level entry point
+        without duplicating the logic — the same delegation pattern already
+        used by :meth:`get_formula_string`.
+
+        Because the renderer and the plotter both resolve β indices through
+        this one function, the β₂ in a printed formula labels the same quantity
+        as the bar annotated β₂ beneath it by construction.
+
+        See :meth:`~ParametricFormulaRenderer.build_beta_index_map` for the
+        ordering rules.
+
+        :returns: Mapping ``{coefficient_name: beta_index}``.
+        :rtype: dict[str, int]
+        """
+        return ParametricFormulaRenderer.build_beta_index_map(
+            coefficients=self.coefficients,
+            intercept=self.intercept,
+        )
+
+    def get_suppressed_coefficients(self, only_active: bool = True) -> set:
+        """
+        Return coefficient names omitted from this model's rendered formula.
+
+        Delegates to
+        :meth:`~ParametricFormulaRenderer.suppressed_coefficients`.  Exposing it
+        here lets the coefficient-change plotter omit exactly the terms the
+        formula omits, without reimplementing the Lasso active-set rule.
+
+        For a ``polynomial-3-lasso`` model whose squared term was zeroed, this
+        returns ``{'x0^2'}`` — so the plot shows bars for β₀, β₁ and β₃, matching
+        the printed ``DWT = β₀ + β₁·L_BP + β₃·L_BP³``.
+
+        :param only_active: When ``False``, returns an empty set (nothing
+            suppressed).  Pass the same value used for
+            :meth:`get_formula_string` so the two agree.
+        :type only_active: bool
+
+        :returns: Set of suppressed coefficient names.
+        :rtype: set[str]
+        """
+        return ParametricFormulaRenderer.suppressed_coefficients(
+            coefficients=self.coefficients,
+            regularization_type=self.regularization_type,
+            active_features=self.active_features,
+            only_active=only_active,
+        )
+
     # =========================================================================
     # Deprecated delegating wrappers
     # =========================================================================
@@ -1227,3 +1568,26 @@ class ModelDescriptor:
     def _get_fp2_second_term_name(self, var_name: str, power: float) -> str:
         """Deprecated — use ParametricFormulaRenderer.get_fp2_second_term_name() directly."""
         return ParametricFormulaRenderer.get_fp2_second_term_name(var_name, power)
+
+if __name__ is "__main__":
+
+
+    kw = dict(
+        model_type='power-log-multivariate',
+        dependent_var='LOA (M)', independent_vars=['DWT', 'BEAM (M)'],
+        transformations=None, coefficients={'b_0_DWT': 0.31, 'b_1_BEAM (M)': 0.44},
+        intercept=1.208, regularization_type=None, active_features=None,
+        polynomial_degree=None, metadata=None,
+    )
+
+    print(ParametricFormulaRenderer.render(**kw, include_coefficients=False))
+    # LOA (M) = β₀·DWT^β₁·BEAM (M)^β₂
+
+    print(ParametricFormulaRenderer.render(**kw, include_coefficients=True))
+    # LOA (M) = 1.208·DWT^0.310·BEAM (M)^0.440
+
+    print(ParametricFormulaRenderer.render(**kw, include_coefficients=False, notation='latex'))
+    # LOA (M) = \beta_{0} \cdot DWT^{\beta_{1}} \cdot BEAM (M)^{\beta_{2}}
+
+    # Key-miss behaviour: a symbol, never a fabricated 0.000
+    print(ParametricFormulaRenderer.render(**{**kw, 'coefficients': {'wrong_key': 0.31}}, include_coefficients=True))

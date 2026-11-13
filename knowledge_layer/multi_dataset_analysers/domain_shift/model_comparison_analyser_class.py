@@ -329,11 +329,40 @@ class ModelComparisonAnalyzer:
 
     def compare_domain_shift(self,
                              selection_metric: str = 'test_rrmse',
-                             verbose_selection: bool = False) -> pd.DataFrame:
+                             verbose_selection: bool = False,
+                         raise_on_empty: bool = False) -> pd.DataFrame:
         """
-        Compare polynomial vs RF domain shift performance.
+        Compare parametric vs Random Forest domain shift performance.
 
-        **ENHANCED DEBUG VERSION**
+        For each target present in both analyzers' results, the best
+        combination is selected by ``selection_metric`` and the two methods
+        are compared on conventional test, matched, and alternative
+        performance.
+
+        An empty result is a legitimate outcome, not an error: when the
+        alternative dataset for a fuel category contains zero ships (e.g. a
+        pure-alternative subset that is empty after fuel reclassification),
+        both analyzers legitimately have no results and there is nothing to
+        compare. In that case an empty DataFrame is returned (with a clear
+        console message) unless ``raise_on_empty=True``.
+
+        :param selection_metric: Metric used to pick the best combination per
+            target. One of ``'test_rrmse'``, ``'alternative_rrmse'``, or
+            ``'selector'`` (use the original selector recommendations).
+        :type selection_metric: str
+        :param verbose_selection: Print per-target selection details.
+        :type verbose_selection: bool
+        :param raise_on_empty: If ``True``, raise :class:`ValueError` when no
+            comparison rows can be generated. If ``False`` (default), return
+            an empty DataFrame so batch pipelines can skip gracefully.
+        :type raise_on_empty: bool
+        :returns: One row per comparable target with test/alternative RRMSE,
+            fuel-type gaps, and RF-advantage columns. Empty if there is no
+            comparable data.
+        :rtype: pandas.DataFrame
+        :raises ValueError: If both domain analyzers were not provided, if
+            ``selection_metric`` is invalid, or (when ``raise_on_empty=True``)
+            if no comparison data could be generated.
         """
 
         if not self.can_compare_domain:
@@ -346,16 +375,31 @@ class ModelComparisonAnalyzer:
         print(f"  verbose_selection: {verbose_selection}")
 
         # Validate selection_metric
-        valid_metrics = ['test_rrmse', 'alternative_rrmse', 'selector']
+        valid_metrics = ['test_rrmse', 'alternative_rrmse','train_rrmse', 'selector']
         if selection_metric not in valid_metrics:
             raise ValueError(f"selection_metric must be one of {valid_metrics}, got '{selection_metric}'")
 
         poly_results = self.poly_domain.results
         rf_results = self.rf_domain.results
 
+        common_targets = sorted(set(poly_results.keys()) & set(rf_results.keys()))
+
         print(f"\n  Poly domain analyzer has results for {len(poly_results)} targets")
         print(f"  RF domain analyzer has results for {len(rf_results)} targets")
         print(f"  Common targets: {sorted(set(poly_results.keys()) & set(rf_results.keys()))}")
+
+        # ── EARLY EXIT: nothing to compare ─────────────────────────────────
+        # This happens legitimately when the alternative dataset is empty
+        # (e.g. zero pure-alternative-fuel ships after fuel reclassification).
+        if not common_targets:
+            msg = ("No common targets between parametric and RF analyzers — "
+                   "likely an empty alternative dataset for this fuel category. "
+                   "No comparison possible.")
+            if raise_on_empty:
+                raise ValueError(msg)
+            print(f"\n  ⚠️  {msg}")
+            print("  Returning empty DataFrame.\n")
+            return pd.DataFrame()
 
         comparison_data = []
 
@@ -1043,6 +1087,12 @@ class ModelComparisonAnalyzer:
 
         comparison_df = self.compare_domain_shift()
 
+        # ── EARLY EXIT: nothing to plot ──────────────────────────────────
+        if comparison_df.empty:
+            print(f"⚠️  No comparison data for {ship_type_str} {dataset or ''} — "
+                  f"skipping domain shift comparison plot.")
+            return
+
         # ── figure / gridspec ───────────────────────────────────────────────
         fig = plt.figure(figsize=figsize)
         gs = fig.add_gridspec(
@@ -1427,19 +1477,21 @@ class ModelComparisonAnalyzer:
                           f"targets={[targets[p] for p in positions]}")
 
             # Summary text box
-            metric_label = threshold_metric.capitalize()
-            lines = [f"Ref. lines ({metric_label} conv. test NRMSE):"]
-            for cat, val in sorted(category_thresholds.items()):
-                lines.append(f"  {cat}: {val:.1f}%")
 
-            ax.text(0.02, 0.98, '\n'.join(lines),
-                    transform=ax.transAxes,
-                    fontsize=fs['textbox'],
-                    va='top', ha='left',
-                    bbox=dict(boxstyle='round,pad=0.4',
-                              facecolor='lightyellow',
-                              edgecolor='gray', alpha=0.9),
-                    family='monospace', zorder=15)
+
+            # metric_label = threshold_metric.capitalize()
+            # lines = [f"Ref. lines ({metric_label} conv. test NRMSE):"]
+            # for cat, val in sorted(category_thresholds.items()):
+            #     lines.append(f"  {cat}: {val:.1f}%")
+            #
+            # ax.text(0.02, 0.98, '\n'.join(lines),
+            #         transform=ax.transAxes,
+            #         fontsize=fs['textbox'],
+            #         va='top', ha='left',
+            #         bbox=dict(boxstyle='round,pad=0.4',
+            #                   facecolor='lightyellow',
+            #                   edgecolor='gray', alpha=0.9),
+            #         family='monospace', zorder=15)
 
         # ── axis decoration ──────────────────────────────────────────────────
         ax.set_xlabel('Target Dimension',  fontsize=fs['axis_label'])

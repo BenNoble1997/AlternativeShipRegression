@@ -21,10 +21,12 @@ from knowledge_layer.multi_dataset_analysers.rf_analysis_foundation import Rando
 from knowledge_layer.multi_dataset_analysers.domain_shift_plotting_class import (
     AnalysisPlotter, ResidualData, PredictionData, FourWayMetrics, DatasetMetrics
 )
+from knowledge_layer.fleet_data_class.temporal_eligibility import TemporalEligibility
+
 from knowledge_layer.Metrics.regression_metrics_class import RegressionMetrics
 from knowledge_layer.data_split_handling_class import DataSplitHandler
 
-from config import LoggerMixin
+from config.loggermixin.logger_config import LoggerMixin
 
 
 class RandomForestDomainAnalyzer(LoggerMixin):
@@ -61,7 +63,14 @@ class RandomForestDomainAnalyzer(LoggerMixin):
                  random_state: int = 42,
                  verbose: bool = True,
                  selection_metric: str = 'rrmse',
-                 target_predictor_constraints:dict[list,list[str]]=None):
+                 target_predictor_constraints:dict[list,list[str]]=None,
+                 build_year_col:str|None=None,
+                 year_edges:list[str]=None,
+                 build_eligibility:TemporalEligibility|None=None,
+                 matching_bins:dict[str,list[str]]=None,
+                 n_matches_per_ship:int=10,
+                 caliper:float|None=None
+                 ):
         """
         Initialize Random Forest Domain Analyzer.
 
@@ -106,7 +115,14 @@ class RandomForestDomainAnalyzer(LoggerMixin):
             random_state=random_state,
             verbose=verbose,
             selection_metric=selection_metric,
-            target_predictor_constraints=target_predictor_constraints  # ✅ NEW
+            target_predictor_constraints=target_predictor_constraints,
+            defer_matched_sets=True,
+            build_year_col=build_year_col,
+            year_edges=year_edges,
+            eligibility=build_eligibility,
+            n_matches_per_ship=n_matches_per_ship,
+            matching_bins=matching_bins,
+            caliper=caliper
         )
 
         # Store local configuration
@@ -118,6 +134,12 @@ class RandomForestDomainAnalyzer(LoggerMixin):
 
         # Split conventional data into train/test
         self._split_conventional_data()
+
+        self.foundation.build_matched_sets(
+            candidate_pool=self.conventional_test,
+            debug=self.verbose,
+        )
+
 
         # Storage
         self.results = {}
@@ -158,32 +180,34 @@ class RandomForestDomainAnalyzer(LoggerMixin):
     # ========================================================================
 
     def _split_conventional_data(self):
-        """Split conventional dataset into train/test, storing indices for reuse."""
+        """
+        Split the conventional dataset into train and test partitions.
+
+        Uses a stratified split on DWT quintiles, implemented via positional
+        index splitting (``train_test_split`` on ``np.arange(n)`` with
+        ``stratify=pd.qcut(DWT, 5)``). This is intentionally IDENTICAL to the
+        implementation in :class:`RandomForestDomainAnalyzer`: because matched
+        conventional datasets are built from the test partition, both analyzers
+        must produce the same partition under the same ``random_state`` for the
+        parametric-vs-RF comparison to be evaluated against identical matched
+        sets. Do not change one implementation without changing the other.
+
+        Index-based splitting also avoids the failure modes of value-based
+        membership reconstruction: rows containing NaN and duplicate-valued
+        sister ships are assigned unambiguously by position.
+
+        Sets ``self.conventional_train``, ``self.conventional_test``,
+        ``self._train_indices``, and ``self._test_indices``. Original DataFrame
+        index labels are preserved by ``.iloc`` selection on a copy.
+        """
+        from sklearn.model_selection import train_test_split
+
         conv_data = self.conventional_full.copy()
         n = len(conv_data)
+        all_indices = np.arange(n)
 
         if 'DWT' in conv_data.columns:
             try:
-                X = conv_data.values
-                y = conv_data[self.target_dimensions[0]].values
-                dwt_col = list(conv_data.columns).index('DWT')
-
-                X_train, X_test, _, _ = DataSplitHandler.create_stratified_train_test_split(
-                    X=X,
-                    y=y,
-                    stratify_col_index=dwt_col,
-                    test_size=self.test_size,
-                    random_state=self.random_state,
-                    n_bins=5
-                )
-
-                # Reconstruct boolean masks by matching DWT values back to original rows
-                # Use index tracking instead of value matching
-                all_indices = np.arange(n)
-                rng = np.random.default_rng(self.random_state)
-
-                # Re-run split to get indices (same seed = same result)
-                from sklearn.model_selection import train_test_split
                 dwt_vals = conv_data['DWT'].values
                 bins = pd.qcut(dwt_vals, q=5, labels=False, duplicates='drop')
 
@@ -421,6 +445,9 @@ class RandomForestDomainAnalyzer(LoggerMixin):
             # Predict on all datasets
             predictions = {}
             for dataset_name, X_data in datasets_to_predict.items():
+                if X_data is None:
+                    predictions[dataset_name] = None
+                    continue
                 predictions[dataset_name] = rf.predict(X_data)
 
         except Exception as e:
@@ -448,10 +475,25 @@ class RandomForestDomainAnalyzer(LoggerMixin):
                               predictors: List[str],
                               target: str) -> Optional[Dict]:
         """
-        Prepare data from all four datasets with proper cleaning.
+    Prepare data from all four evaluation datasets with proper cleaning.
 
-        Uses foundation for data preparation and matched dataset access.
-        """
+    Train and test come from the pre-split conventional partitions; the
+    matched set comes from the foundation (built from the test partition,
+    so strictly out-of-sample); the alternative set may legitimately be
+    unavailable for a combination with too few complete rows, in which
+    case ``X_alternative``/``y_alternative`` are ``None`` and downstream
+    metrics for that dataset are reported as NaN. This mirrors the
+    parametric analyzer exactly so both produce structurally identical
+    result rows.
+
+    :param predictors: Predictor column names for this combination.
+    :type predictors: list[str]
+    :param target: Target column name.
+    :type target: str
+    :returns: Dict of prepared arrays, or ``None`` if conventional or
+        matched data is insufficient.
+    :rtype: dict or None
+    """
         # 1. TRAIN DATA (from pre-split conventional_train)
         train_prep = self.foundation.prepare_dataset(
             self.conventional_train, predictors, target, min_samples=10
@@ -500,12 +542,15 @@ class RandomForestDomainAnalyzer(LoggerMixin):
             self.alternative, predictors, target, min_samples=3
         )
 
-        if alt_prep is None:
-            if self.verbose:
-                print(f"  Warning: Insufficient alternative data")
-            return None
+        if alt_prep is not None:
+            X_alt, y_alt = alt_prep
 
-        X_alt, y_alt = alt_prep
+        else:
+            if self.verbose:
+                print(f"  ⚠️  {predictors} → {target}: Alternative data unavailable")
+            X_alt, y_alt = None, None
+
+
 
         return {
             'X_train': X_train, 'y_train': y_train,
@@ -531,6 +576,15 @@ class RandomForestDomainAnalyzer(LoggerMixin):
         for dataset_name in ['train', 'test', 'matched', 'alternative']:
             y_true = actuals[dataset_name]
             y_pred = predictions[dataset_name]
+
+            if y_true is None or y_pred is None:
+                result[f'{dataset_name}_r2'] = np.nan
+                result[f'{dataset_name}_rmse'] = np.nan
+                result[f'{dataset_name}_rrmse'] = np.nan
+                result[f'{dataset_name}_mae'] = np.nan
+                result[f'{dataset_name}_mape'] = np.nan
+                result[f'{dataset_name}_n'] = 0
+                continue
 
             metric_calculator = RegressionMetrics(y_true, y_pred)
 

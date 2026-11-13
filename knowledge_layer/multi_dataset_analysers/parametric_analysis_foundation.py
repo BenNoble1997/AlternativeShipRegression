@@ -19,12 +19,14 @@ import pandas as pd
 import numpy as np
 from typing import List, Dict, Optional, Tuple
 
-from config import LoggerMixin
+from config.loggermixin.logger_config import LoggerMixin
 from knowledge_layer.fleet_data_class.matched_dataset_creation import MatchedDataset
+from knowledge_layer.fleet_data_class.temporal_eligibility import TemporalEligibility
 from knowledge_layer.parametric_regression.parametric_regression_model_factory_class import ModelFactory
 from knowledge_layer.model_selectors.best_model_selector import BestModelSelector
 from knowledge_layer.data_split_handling_class import DataSplitHandler
 from knowledge_layer.Metrics.regression_metrics_class import RegressionMetrics
+
 
 
 class ParametricAnalysisFoundation(LoggerMixin):
@@ -42,71 +44,99 @@ class ParametricAnalysisFoundation(LoggerMixin):
     - Provide utility methods for common operations
     """
 
+    #: Model families whose functional form is preserved by scaling but broken
+    #: by translation. Fractional powers and logarithms require strictly
+    #: positive support, so subtracting a mean (or a minimum) both changes what
+    #: is being estimated and pushes roughly half of a right-skewed fleet below
+    #: zero. See :meth:`_normalize_data` for the full argument.
+    MULTIPLICATIVE_MODEL_TYPES = frozenset({
+        'mfp',
+        'power-log-multivariate', 'exponential-log-multivariate',
+        'power', 'power-offset',
+        'logarithmic', 'logarithmic-power',
+        'exponential', 'exponential-offset',
+    })
+
     def __init__(self,
                  conventional_data: pd.DataFrame,
                  alternative_data: pd.DataFrame,
-                 independent_variables: List[str],
-                 dependent_variables: Optional[List[str]] = None,
-                 model_recommendations: Optional[Dict] = None,
+                 independent_variables: list[str],
+                 dependent_variables: list[str] | None = None,
+                 model_recommendations: dict | None = None,
                  random_state: int = 42,
                  verbose: bool = True,
-                 detailed_results: Optional[Dict] = None,
-                 selection_metric:str = 'rrmse',
+                 detailed_results: dict | None = None,
+                 selection_metric: str = 'rrmse',
                  selection_strategy: str = 'simple',
-                target_predictor_constraints: Optional[Dict[str, List[str]]] = None):
+                 target_predictor_constraints: dict[str, list[str]] | None = None,
+                 defer_matched_sets: bool = False,
+                 n_matches_per_ship:int=10,
+                 caliper:float|None=None,
+                 build_year_col:str|None=None,
+                 year_edges: list[int] | None = None,
+                 matching_bins:dict[str, list] | None = None,
+                 build_eligibility: TemporalEligibility | None = None,
+                 ):
         """
         Initialize analysis foundation.
 
-        Parameters
-        ----------
-        conventional_data : pd.DataFrame
-            Full conventional ship dataset
-        alternative_data : pd.DataFrame
-            Alternative fuel ships dataset
-        independent_variables : List[str]
-            List of potential predictor dimensions
-        dependent_variables : List[str], optional
-            List of target dimensions. If None, uses independent_variables.
-        model_recommendations : dict, optional
-            Dictionary from ParametricModelSelector.model_recommendations
-            Format: {(predictor_tuple, target): model_type_string}
-            **REQUIRED for proper operation**
-
-        target_predictor_constraints : dict, optional
-            Restricts which predictor variables may be used for each target.
-            Format: {target_name: [allowed_predictor_1, allowed_predictor_2, ...]}
-            Example: {'LBP (M)': ['DWT', 'TEU']}
-            Any combination for a constrained target that contains predictors
-            outside the allowed list is excluded, regardless of model performance.
-            Targets not mentioned in the dict are unconstrained.
-
-        random_state : int, default=42
-            Random seed for reproducibility
-        verbose : bool, default=True
-            Whether to print progress and warnings
+        :param conventional_data: Full conventional ship dataset.
+        :type conventional_data: pandas.DataFrame
+        :param alternative_data: Alternative fuel ships dataset.
+        :type alternative_data: pandas.DataFrame
+        :param independent_variables: Potential predictor dimensions.
+        :type independent_variables: list[str]
+        :param dependent_variables: Target dimensions. If ``None``, uses
+            ``independent_variables``.
+        :type dependent_variables: list[str] or None
+        :param model_recommendations: Mapping
+            ``{(predictor_tuple, target): model_type}`` from the selector.
+            Required for operation.
+        :type model_recommendations: dict or None
+        :param random_state: Random seed for reproducibility.
+        :type random_state: int
+        :param verbose: Whether to print progress and warnings.
+        :type verbose: bool
+        :param detailed_results: Selector's detailed per-combination metrics.
+        :type detailed_results: dict or None
+        :param selection_metric: Metric used by the internal
+            :class:`BestModelSelector`.
+        :type selection_metric: str
+        :param selection_strategy: Strategy used by the internal
+            :class:`BestModelSelector`.
+        :type selection_strategy: str
+        :param target_predictor_constraints: Restriction of allowed predictors
+            per target, ``{target: [allowed_predictors]}``. Targets not listed
+            are unconstrained.
+        :type target_predictor_constraints: dict[str, list[str]] or None
+        :param defer_matched_sets: If ``True``, matched conventional datasets
+            are NOT built during initialisation; the owning analyzer must call
+            :meth:`build_matched_sets` after performing its train/test split,
+            supplying the held-out test partition as the candidate pool. This
+            prevents train-set leakage into matched-set evaluation. If
+            ``False`` (legacy behaviour), matched sets are built immediately
+            from the full conventional fleet.
+        :type defer_matched_sets: bool
+        :param n_matches_per_ship: Number of matches that should be used when creating the matched dataset.
+        :param build_year_col: Name of column that contains the build year
+        :build_year_edges: year edges for binning conventional dataset for matching
         """
         self.random_state = random_state
         self.verbose = verbose
 
-        # ✅ Store BOTH for parametric selector
         self.model_recommendations = model_recommendations or {}
         self.detailed_results = detailed_results or {}
 
-        # Store and validate constraints
         self.target_predictor_constraints = target_predictor_constraints or {}
         if self.target_predictor_constraints and verbose:
             self._print_constraint_summary()
 
-        # ✅ Initialize BestModelSelector
         self.model_selector = BestModelSelector(
             selection_metric=selection_metric,
             selection_strategy=selection_strategy,
             verbose=verbose
         )
 
-        self.detailed_results = detailed_results or {}
-
-        # Setup dimensions
         if dependent_variables is None:
             dependent_variables = independent_variables
 
@@ -116,28 +146,310 @@ class ParametricAnalysisFoundation(LoggerMixin):
             dependent_variables=dependent_variables
         )
 
-        # Store datasets
-        self.conventional_full = conventional_data[self.available_dimensions].copy()
-        self.alternative = alternative_data[self.available_dimensions].copy()
+        self.build_year_col=build_year_col
+        self.year_edges=year_edges
+        self.build_eligibility = build_eligibility
+        self.caliper = caliper
+        self.matching_bins = matching_bins
 
-        # Validate and store model recommendations
+
+        self.conventional_full = self._resolve_data_variables(name='conventional_full', data=conventional_data.copy())
+        self.alternative = self._resolve_data_variables(name='alternative', data=alternative_data.copy())
+
         self._validate_model_recommendations(model_recommendations)
         self.model_recommendations = model_recommendations
 
-        # Validate data quality
         self._validate_data_quality()
 
-        # ✅ NEW: Print diagnostics BEFORE creating matched datasets
         if verbose:
             self.print_variable_diagnostics()
 
-        # Create matched datasets (now with filtering)
-        self.matched_data_sets = self._create_matched_sets()
+        self.n_matches_per_ship = n_matches_per_ship
+
+        # Matched sets: build now (legacy) or defer until the analyzer has
+        # split the conventional data and can supply the test partition.
+        if defer_matched_sets:
+            self.matched_data_sets = {}
+            if verbose:
+                print("\n  Matched dataset creation deferred — call "
+                      "build_matched_sets(candidate_pool=...) after the "
+                      "train/test split.")
+        else:
+            self.matched_data_sets = self._create_matched_sets()
+
         self.selector = None  # Will be set by analyzer if available
+
+        self.build_year_col = build_year_col
+        self.edges = year_edges
+
+
 
     # ========================================================================
     # SETUP AND VALIDATION
     # ========================================================================
+
+        #: Model families whose functional form is preserved by scaling but broken
+        #: by translation. Fractional powers and logarithms require strictly
+        #: positive support, so subtracting a mean (or a minimum) both changes what
+        #: is being estimated and pushes roughly half of a right-skewed fleet below
+        #: zero. See :meth:`_normalize_data` for the full argument.
+        MULTIPLICATIVE_MODEL_TYPES = frozenset({
+            'mfp',
+            'power-log-multivariate', 'exponential-log-multivariate',
+            'power', 'power-offset',
+            'logarithmic', 'logarithmic-power',
+            'exponential', 'exponential-offset',
+        })
+
+    def _resolve_data_variables(self, name, data):
+        """
+        resolve which variables should be extracted and used in the datasets.
+
+
+        :return:
+        """
+
+        retained = list(self.available_dimensions)
+
+        if self.build_year_col is not None:
+
+            if self.build_year_col not in data.columns:
+                raise KeyError(
+                    f"build_year_col '{self.build_year_col}' is not a column of the "
+                    f"{name} dataset, so build-year blocking cannot be applied."
+                )
+            retained.append(self.build_year_col)
+
+        if self.build_eligibility is not None:
+
+            if self.build_eligibility.anchor_column not in data.columns:
+                raise KeyError(
+                    f"build_year_col '{self.build_eligibility.anchor_column}' is not a column of the "
+                    f"{name} dataset, so build-year blocking cannot be applied."
+                )
+            retained.append(self.build_eligibility.anchor_column)
+
+        if self.matching_bins is not None:
+
+            if isinstance(self.matching_bins, list):
+                columns = self.matching_bins
+            else:
+                columns=self.matching_bins.keys()
+
+            for column in columns:
+                if column not in data.columns:
+                    raise KeyError(
+                            f"build_year_col '{column}' is not a column of the "
+                            f"{name} dataset, so build-year blocking cannot be applied."
+                        )
+                retained.append(column)
+
+        result = data[list(set(retained))].copy()
+
+
+        return result
+
+    @classmethod
+    def resolve_normalization_method(
+            cls,
+            model_type: str,
+            default: str = 'zscore',
+    ) -> str:
+        """
+        Return the normalisation method appropriate to a model's functional form.
+
+        Centring is a change of *variable*; scaling is only a change of *units*.
+        Which of the two is admissible depends on the model form, so the choice
+        belongs to the model type rather than to a global analyser setting.
+
+        - **Additive forms** (linear, ridge, integer-power polynomials) are
+          closed under affine transformation: a cubic fitted on z-scored ``x``
+          is the identical function to one fitted on raw ``x``, written in a
+          different basis.  Centring is therefore free, and it substantially
+          decorrelates the polynomial columns — on a right-skewed fleet,
+          ``corr(x, x²)`` falls from about 0.96 to about 0.64.  Since this
+          analysis differences coefficients between cohorts, that conditioning
+          improvement is what makes the coefficients stable enough to compare.
+
+        - **Multiplicative forms** (:attr:`MULTIPLICATIVE_MODEL_TYPES`) are
+          closed under scaling but not translation.  For :math:`y = ax^{b}`,
+          substituting :math:`x' = x/\\mu_x`, :math:`y' = y/\\mu_y` gives
+          :math:`y' = (a\\mu_x^{b}/\\mu_y)x'^{b}` — the exponent is exactly
+          preserved and only the constant absorbs the scaling.  Subtracting a
+          mean has no such reparametrisation: the fitted quantity stops being an
+          elasticity, and the positivity filter required by :math:`\\ln(\\cdot)`
+          discards every observation below the mean.
+
+        ``'mfp'`` is included in the multiplicative set: fractional powers such
+        as :math:`x^{-1/3}` and :math:`1/\\sqrt{x}` need positive support, and
+        :meth:`MFP._shift_to_positive` otherwise applies a *data-dependent*
+        shift of ``abs(x.min()) + 0.1`` that is recomputed per fit — so each
+        cohort receives a different transformation and the compared
+        coefficients are not coefficients of the same model.  Under scale-only
+        normalisation that method short-circuits on ``np.all(x > 0)`` and the
+        problem does not arise.
+
+        :param model_type: Model-type identifier.
+        :type model_type: str
+        :param default: Method used for additive forms.
+        :type default: str
+
+        :returns: ``'scale'`` for multiplicative forms, otherwise ``default``.
+        :rtype: str
+        """
+        return 'scale' if model_type in cls.MULTIPLICATIVE_MODEL_TYPES else default
+
+    def _create_matched_sets(self,
+                             candidate_pool: pd.DataFrame | None = None
+                             ) -> dict[tuple[str, ...], pd.DataFrame]:
+        """
+        Create matched conventional datasets for each predictor combination.
+
+        Matching is one dataset per unique predictor tuple, matched on exactly
+        those predictors via standardized Euclidean distance.
+
+        :param candidate_pool: Conventional ships eligible to be selected as
+            matches. When ``None``, the full conventional fleet is used
+            (legacy behaviour, which leaks training ships into matched-set
+            evaluation). When the analyzer supplies its held-out test
+            partition, matched-set evaluation is strictly out-of-sample.
+        :type candidate_pool: pandas.DataFrame or None
+        :returns: Mapping ``predictor_tuple → matched_dataset``.
+        :rtype: dict[tuple[str, ...], pandas.DataFrame]
+        :raises ValueError: If no valid predictor combinations remain after
+            availability filtering.
+        :raises KeyError: If matching fails due to a predictor missing from
+            the candidate pool's columns.
+        """
+        pool = candidate_pool if candidate_pool is not None else self.conventional_full
+
+        # Collect all unique predictor combinations
+        combo_list = []
+        for target in self.target_dimensions:
+            combos = self.extract_combinations_for_target(target)
+            combo_list.extend(combos)
+
+        all_unique_combos = sorted(set(combo_list))
+
+        valid_combos = []
+        skipped_combos = []
+
+        for combo in all_unique_combos:
+            if all(pred in self.available_dimensions for pred in combo):
+                valid_combos.append(combo)
+            else:
+                missing = [pred for pred in combo if pred not in self.available_dimensions]
+                skipped_combos.append((combo, missing))
+
+        if skipped_combos and self.verbose:
+            print(f"\n⚠️  Skipped {len(skipped_combos)} combinations due to missing variables:")
+            for combo, missing in skipped_combos[:5]:
+                print(f"  • {combo}: missing {missing}")
+            if len(skipped_combos) > 5:
+                print(f"  • ... and {len(skipped_combos) - 5} more")
+            print()
+
+        if not valid_combos:
+            raise ValueError(
+                "No valid predictor combinations found after filtering!\n"
+                f"All {len(all_unique_combos)} combinations from selector contain variables "
+                f"not present in the current datasets.\n"
+                f"Available dimensions: {self.available_dimensions}\n"
+                f"Consider passing the same variable list to analyzer as was used in selector."
+            )
+
+        if self.verbose:
+            pool_desc = ("held-out test partition" if candidate_pool is not None
+                         else "FULL conventional fleet (legacy — includes train ships)")
+            print(f"\nCreating matched datasets for {len(valid_combos)} valid predictor "
+                  f"combinations from {pool_desc} ({len(pool)} candidate ships)...")
+
+        try:
+
+            if self.build_eligibility is not None:
+                matched_sets = MatchedDataset.multiple_matched_datasets(
+                    alternative_fleet=self.alternative,
+                    conventional_fleet=pool,
+                    logger=self.logger,
+                    predictor_groups=valid_combos,
+                    n_matches_per_ship=self.n_matches_per_ship,
+                    std_reference='conventional',
+                    eligibility=self.build_eligibility,
+                    caliper=self.caliper,
+                    binning_features=self.matching_bins
+                )
+
+            elif self.build_year_col is not None:
+                alt_fleet,conv_fleet = MatchedDataset.add_build_year_window(alternative_fleet=self.alternative,
+                                                     conventional_fleet=pool,
+                                                     year_column=self.build_year_col, edges=self.year_edges)
+
+                matched_sets = MatchedDataset.multiple_matched_datasets(
+                    alternative_fleet=alt_fleet,
+                    conventional_fleet=conv_fleet,
+                    logger=self.logger,
+                    predictor_groups=valid_combos,
+                    n_matches_per_ship=self.n_matches_per_ship,
+                    std_reference='conventional',
+                    binning_features=['BUILD_YEAR_WINDOW'],
+                    caliper=self.caliper
+                )
+
+            else:
+
+                matched_sets = MatchedDataset.multiple_matched_datasets(
+                    alternative_fleet=self.alternative,
+                    conventional_fleet=pool,
+                    logger=self.logger,
+                    predictor_groups=valid_combos,
+                    n_matches_per_ship=self.n_matches_per_ship,
+                    std_reference='conventional',
+                    caliper=self.caliper,
+                    binning_features=self.matching_bins
+                )
+        except KeyError as e:
+            raise KeyError(
+                f"Matched dataset creation failed: {str(e)}\n"
+                f"This suggests a predictor variable exists in available_dimensions "
+                f"but not in the candidate pool's columns.\n"
+                f"Available dimensions: {self.available_dimensions}\n"
+                f"Pool columns: {list(pool.columns)}"
+            ) from e
+
+        if self.verbose:
+            print(f"✅ Created {len(matched_sets)} matched datasets")
+
+        return matched_sets
+
+    def build_matched_sets(self,
+                           candidate_pool: pd.DataFrame | None = None,
+                           debug: bool = False) -> None:
+        """
+        Build (or rebuild) the matched conventional datasets.
+
+        Intended to be called by the owning analyzer after it has performed
+        its train/test split, passing the held-out test partition as the
+        candidate pool. This guarantees that matched-set evaluation never
+        scores the model on ships it was trained on, which is essential for
+        fair parametric-vs-Random-Forest gap comparisons (flexible models
+        memorise training points and would otherwise show deflated matched
+        error).
+
+        :param candidate_pool: Conventional ships eligible as match candidates
+            (typically the analyzer's ``conventional_test``). ``None`` falls
+            back to the full conventional fleet.
+        :type candidate_pool: pandas.DataFrame or None
+        :param debug: Print candidate pool size and per-combination matched
+            sizes after construction.
+        :type debug: bool
+        """
+        self.matched_data_sets = self._create_matched_sets(candidate_pool=candidate_pool)
+
+        if debug:
+            pool_n = len(candidate_pool) if candidate_pool is not None else len(self.conventional_full)
+            print(f"[build_matched_sets] candidate pool: {pool_n} ships")
+            for combo, df in self.matched_data_sets.items():
+                print(f"[build_matched_sets]   {' + '.join(combo):35s} → matched n = {len(df)}")
 
     def _print_constraint_summary(self):
         """Print a summary of active target predictor constraints."""
@@ -362,85 +674,85 @@ class ParametricAnalysisFoundation(LoggerMixin):
     # ========================================================================
     # MATCHED DATASET CREATION
     # ========================================================================
-
-    def _create_matched_sets(self) -> Dict[Tuple[str, ...], pd.DataFrame]:
-        """
-        Create matched conventional datasets for each predictor combination.
-
-        **FILTERS** combinations to only include those with all variables available
-        in the current datasets.
-
-        Returns
-        -------
-        dict
-            Maps predictor_tuple → matched_dataset_df
-        """
-        # Collect all unique predictor combinations
-        combo_list = []
-        for target in self.target_dimensions:
-            combos = self.extract_combinations_for_target(target)
-            combo_list.extend(combos)
-
-        # Get unique combinations
-        all_unique_combos = sorted(set(combo_list))
-
-        # ✅ FILTER: Only keep combinations where ALL predictors are available
-        valid_combos = []
-        skipped_combos = []
-
-        for combo in all_unique_combos:
-            # Check if all predictors in this combination are available
-            if all(pred in self.available_dimensions for pred in combo):
-                valid_combos.append(combo)
-            else:
-                missing = [pred for pred in combo if pred not in self.available_dimensions]
-                skipped_combos.append((combo, missing))
-
-        # Report skipped combinations
-        if skipped_combos and self.verbose:
-            print(f"\n⚠️  Skipped {len(skipped_combos)} combinations due to missing variables:")
-            for combo, missing in skipped_combos[:5]:  # Show first 5
-                print(f"  • {combo}: missing {missing}")
-            if len(skipped_combos) > 5:
-                print(f"  • ... and {len(skipped_combos) - 5} more")
-            print()
-
-        if not valid_combos:
-            raise ValueError(
-                "No valid predictor combinations found after filtering!\n"
-                f"All {len(all_unique_combos)} combinations from selector contain variables "
-                f"not present in the current datasets.\n"
-                f"Available dimensions: {self.available_dimensions}\n"
-                f"Consider passing the same variable list to analyzer as was used in selector."
-            )
-
-        if self.verbose:
-            print(f"\nCreating matched datasets for {len(valid_combos)} valid predictor combinations "
-                  f"(filtered from {len(all_unique_combos)} total)...")
-
-        # Create matched datasets only for valid combinations
-        try:
-            matched_sets = MatchedDataset.multiple_matched_datasets(
-                alternative_fleet=self.alternative,
-                conventional_fleet=self.conventional_full,
-                logger=self.logger,
-                predictor_groups=valid_combos,
-                std_reference='conventional'
-            )
-        except KeyError as e:
-            # If matching fails due to missing variables, provide helpful error
-            raise KeyError(
-                f"Matched dataset creation failed: {str(e)}\n"
-                f"This suggests a predictor variable exists in available_dimensions "
-                f"but not in the actual dataset columns.\n"
-                f"Available dimensions: {self.available_dimensions}\n"
-                f"Dataset columns: {list(self.conventional_full.columns)}"
-            ) from e
-
-        if self.verbose:
-            print(f"✅ Created {len(matched_sets)} matched datasets")
-
-        return matched_sets
+    #
+    # def _create_matched_sets(self) -> Dict[Tuple[str, ...], pd.DataFrame]:
+    #     """
+    #     Create matched conventional datasets for each predictor combination.
+    #
+    #     **FILTERS** combinations to only include those with all variables available
+    #     in the current datasets.
+    #
+    #     Returns
+    #     -------
+    #     dict
+    #         Maps predictor_tuple → matched_dataset_df
+    #     """
+    #     # Collect all unique predictor combinations
+    #     combo_list = []
+    #     for target in self.target_dimensions:
+    #         combos = self.extract_combinations_for_target(target)
+    #         combo_list.extend(combos)
+    #
+    #     # Get unique combinations
+    #     all_unique_combos = sorted(set(combo_list))
+    #
+    #     # ✅ FILTER: Only keep combinations where ALL predictors are available
+    #     valid_combos = []
+    #     skipped_combos = []
+    #
+    #     for combo in all_unique_combos:
+    #         # Check if all predictors in this combination are available
+    #         if all(pred in self.available_dimensions for pred in combo):
+    #             valid_combos.append(combo)
+    #         else:
+    #             missing = [pred for pred in combo if pred not in self.available_dimensions]
+    #             skipped_combos.append((combo, missing))
+    #
+    #     # Report skipped combinations
+    #     if skipped_combos and self.verbose:
+    #         print(f"\n⚠️  Skipped {len(skipped_combos)} combinations due to missing variables:")
+    #         for combo, missing in skipped_combos[:5]:  # Show first 5
+    #             print(f"  • {combo}: missing {missing}")
+    #         if len(skipped_combos) > 5:
+    #             print(f"  • ... and {len(skipped_combos) - 5} more")
+    #         print()
+    #
+    #     if not valid_combos:
+    #         raise ValueError(
+    #             "No valid predictor combinations found after filtering!\n"
+    #             f"All {len(all_unique_combos)} combinations from selector contain variables "
+    #             f"not present in the current datasets.\n"
+    #             f"Available dimensions: {self.available_dimensions}\n"
+    #             f"Consider passing the same variable list to analyzer as was used in selector."
+    #         )
+    #
+    #     if self.verbose:
+    #         print(f"\nCreating matched datasets for {len(valid_combos)} valid predictor combinations "
+    #               f"(filtered from {len(all_unique_combos)} total)...")
+    #
+    #     # Create matched datasets only for valid combinations
+    #     try:
+    #         matched_sets = MatchedDataset.multiple_matched_datasets(
+    #             alternative_fleet=self.alternative,
+    #             conventional_fleet=self.conventional_full,
+    #             logger=self.logger,
+    #             predictor_groups=valid_combos,
+    #             std_reference='conventional'
+    #         )
+    #     except KeyError as e:
+    #         # If matching fails due to missing variables, provide helpful error
+    #         raise KeyError(
+    #             f"Matched dataset creation failed: {str(e)}\n"
+    #             f"This suggests a predictor variable exists in available_dimensions "
+    #             f"but not in the actual dataset columns.\n"
+    #             f"Available dimensions: {self.available_dimensions}\n"
+    #             f"Dataset columns: {list(self.conventional_full.columns)}"
+    #         ) from e
+    #
+    #     if self.verbose:
+    #         print(f"✅ Created {len(matched_sets)} matched datasets")
+    #
+    #     return matched_sets
 
     def get_matched_dataset(self, predictors: Tuple[str, ...]) -> Optional[pd.DataFrame]:
         """
@@ -820,7 +1132,7 @@ class ParametricAnalysisFoundation(LoggerMixin):
                                    predictors: List[str],
                                    target: str,
                                    min_samples: int = 5,
-                                   normalization_params: Optional[Dict] = None,
+                                   normalization_params: dict|None = None,
                                    fit_params: bool = False,
                                    normalization_method: str = 'zscore'
                                    ) -> Optional[Tuple]:
@@ -905,89 +1217,105 @@ class ParametricAnalysisFoundation(LoggerMixin):
             return X_norm, y_norm
 
     def _normalize_data(self,
-                       X: np.ndarray,
-                       y: np.ndarray,
-                       method: str = 'zscore',
-                       fit_params: bool = False,
-                       params: Optional[Dict] = None
-                       ) -> Tuple[np.ndarray, np.ndarray, Optional[Dict]]:
+                        X: np.ndarray,
+                        y: np.ndarray,
+                        method: str = 'zscore',
+                        fit_params: bool = False,
+                        params: Optional[Dict] = None
+                        ) -> Tuple[np.ndarray, np.ndarray, Optional[Dict]]:
         """
         Normalize predictor and target data.
 
-        **Normalization Methods:**
+        **Methods**
 
-        Z-score (standardization):
-        - X_norm = (X - mean) / std
-        - Centers data at 0, scales to unit variance
-        - Preserves outliers
-        - Recommended for coefficient comparison
+        ``'zscore'`` — ``(x - mean) / std``
+            Centres at 0, scales to unit variance.  Use for additive forms,
+            where it is an exact reparametrisation and decorrelates polynomial
+            columns.
 
-        Min-Max (normalization):
-        - X_norm = (X - min) / (max - min)
-        - Scales data to [0, 1] range
-        - Sensitive to outliers
-        - Use when bounded range is important
+        ``'minmax'`` — ``(x - min) / (max - min)``
+            Scales to [0, 1].  Determined by two extreme observations, and
+            maps the smallest training observation to exactly zero.
 
-        Parameters
-        ----------
-        X : np.ndarray
-            Predictor data (n_samples, n_features)
-        y : np.ndarray
-            Target data (n_samples,)
-        method : str, default='zscore'
-            Normalization method: 'zscore' or 'minmax'
-        fit_params : bool, default=False
-            If True, calculate normalization parameters from data
-        params : dict, optional
-            Pre-calculated normalization parameters to apply
+        ``'scale'`` — ``x / mean``
+            Divides by the mean without centring.  A pure change of units: the
+            fleet mean sits at 1.0 and a value of 1.4 reads as 40% above
+            fleet-average.  Required for multiplicative forms; see
+            :meth:`resolve_normalization_method`.
 
-        Returns
-        -------
-        X_norm : np.ndarray
-            Normalized predictors
-        y_norm : np.ndarray
-            Normalized target
-        params : dict or None
-            Normalization parameters (if fit_params=True)
+        .. warning::
 
-        Raises
-        ------
-        ValueError
-            If fit_params=False and params=None
-            If unknown normalization method
+           Do **not** substitute ``'minmax'`` for ``'scale'``.  It carries the
+           same leading subtraction as ``'zscore'``, so it breaks multiplicative
+           forms identically; it maps the smallest training ship to exactly
+           zero, making ``ln(0)`` and ``x^(-1/3)`` infinite; and any evaluation
+           ship smaller than the smallest training ship maps below zero and is
+           then deleted by the positivity filter — precisely the out-of-range
+           vessels a transferability study most needs to retain.
+
+        :param X: Predictor data, shape ``(n_samples, n_features)``.
+        :type X: numpy.ndarray
+        :param y: Target data, shape ``(n_samples,)``.
+        :type y: numpy.ndarray
+        :param method: ``'zscore'``, ``'minmax'`` or ``'scale'``.
+        :type method: str
+        :param fit_params: Calculate parameters from this data when ``True``.
+        :type fit_params: bool
+        :param params: Pre-calculated parameters to apply.
+        :type params: dict, optional
+
+        :returns: ``(X_norm, y_norm, params)``; ``params`` is ``None`` unless
+            ``fit_params`` is ``True``.
+        :rtype: tuple[numpy.ndarray, numpy.ndarray, dict | None]
+
+        :raises ValueError: If the method is unknown, if ``fit_params`` is
+            ``False`` with no ``params``, or if ``'scale'`` is requested on data
+            whose column means are not strictly positive.
         """
+        valid = {'zscore', 'minmax', 'scale'}
+
+        if method not in valid:
+            raise ValueError(
+                f"Unknown normalization method: {method}. "
+                f"Must be one of {sorted(valid)}."
+            )
+
         if fit_params:
-            # Calculate normalization parameters from data
             params = {'X': {}, 'y': {}}
 
             if method == 'zscore':
-                # Z-score normalization: (x - mean) / std
                 params['X']['mean'] = np.mean(X, axis=0)
                 params['X']['std'] = np.std(X, axis=0)
-
                 params['y']['mean'] = np.mean(y)
                 params['y']['std'] = np.std(y)
 
             elif method == 'minmax':
-                # Min-max normalization: (x - min) / (max - min)
                 params['X']['min'] = np.min(X, axis=0)
                 params['X']['max'] = np.max(X, axis=0)
-
                 params['y']['min'] = np.min(y)
                 params['y']['max'] = np.max(y)
 
-            else:
-                raise ValueError(
-                    f"Unknown normalization method: {method}. "
-                    f"Must be 'zscore' or 'minmax'"
-                )
+            else:  # scale
+                X_scale = np.mean(X, axis=0)
+                y_scale = np.mean(y)
+
+                if np.any(X_scale <= 0) or y_scale <= 0:
+                    raise ValueError(
+                        f"Scale-only normalisation requires strictly positive "
+                        f"column means, but got X means {X_scale} and y mean "
+                        f"{y_scale}. This method expects raw physical "
+                        f"quantities; non-positive means indicate the data has "
+                        f"already been centred upstream."
+                    )
+
+                params['X']['scale'] = X_scale
+                params['y']['scale'] = y_scale
 
         elif params is None:
             raise ValueError(
                 "Must provide normalization params when fit_params=False"
             )
 
-        # Apply normalization
         if method == 'zscore':
             X_norm = (X - params['X']['mean']) / (params['X']['std'] + 1e-10)
             y_norm = (y - params['y']['mean']) / (params['y']['std'] + 1e-10)
@@ -995,12 +1323,12 @@ class ParametricAnalysisFoundation(LoggerMixin):
         elif method == 'minmax':
             X_range = params['X']['max'] - params['X']['min']
             y_range = params['y']['max'] - params['y']['min']
-
             X_norm = (X - params['X']['min']) / (X_range + 1e-10)
             y_norm = (y - params['y']['min']) / (y_range + 1e-10)
 
-        else:
-            raise ValueError(f"Unknown normalization method: {method}")
+        else:  # scale — no subtraction, positivity preserved
+            X_norm = X / params['X']['scale']
+            y_norm = y / params['y']['scale']
 
         return X_norm, y_norm, params if fit_params else None
 
@@ -1018,7 +1346,7 @@ class ParametricAnalysisFoundation(LoggerMixin):
             Normalized predictions
         normalization_params : dict
             Normalization parameters from _normalize_data
-        normalization_method : str, default='zscore'
+        normalization_method : str, default='zscore', minmax or scale
             Method used for normalization
 
         Returns
@@ -1034,6 +1362,9 @@ class ParametricAnalysisFoundation(LoggerMixin):
         elif normalization_method == 'minmax':
             y_range = y_params['max'] - y_params['min']
             y_pred = y_pred_norm * y_range + y_params['min']
+
+        elif normalization_method == 'scale':
+            y_pred = y_pred_norm * y_params['scale']
 
         else:
             raise ValueError(f"Unknown normalization method: {normalization_method}")

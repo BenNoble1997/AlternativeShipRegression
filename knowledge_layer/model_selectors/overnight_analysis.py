@@ -9,49 +9,10 @@ from knowledge_layer.model_selectors.parametric_regresssion_selector_class impor
 
 from knowledge_layer.model_selectors.random_forest_selector_class import RandomForestSelector
 
-from knowledge_layer.dataset_storage_and_testing.alt_fuel_datasets import getting_alt_fuel_ships
+from knowledge_layer.dataset_storage_and_testing.alt_fuel_datasets import get_variables, getting_alt_fuel_ships
 
 from parameters.shipshape.ShipShapeBasic_class import ShipType
 
-
-def get_variables(shiptype:ShipType):
-
-    print(f'USING DATA FOR {shiptype} SHIP')
-
-    constant_vars = ['DWT','LBP (M)','LOA (M)','BEAM (M)','DRAFT (M)','DEPTH (M)']
-
-    if shiptype == ShipType.TANKER:
-
-        print('Tanker filepath used')
-        filepath = Path(r'C:\Users\bnoble\GitHub\ShipDesignDigitalTwin\parameters\Databases\clarksons_data\Tanker')
-        save_dir = Path(r'C:\Users\bnoble\GitHub\ShipDesignDigitalTwin\knowledge_layer\results\Tanker')
-        bins = {'DWT': [10000, 25000, 55000, 75000, 120000, 170000, 250000, 330000, np.inf]}
-        variables = constant_vars + ['MCR (KW)']
-
-
-    elif shiptype == ShipType.BULK_CARRIER:
-        print('bulk carrier filepath used')
-        filepath=Path(r'C:\Users\bnoble\GitHub\ShipDesignDigitalTwin\parameters\Databases\clarksons_data\bulk_carrier')
-        save_dir = Path(r'C:\Users\bnoble\GitHub\ShipDesignDigitalTwin\knowledge_layer\results\Bulk_carrier')
-        bins = {'DWT': [10000, 25000, 55000, 75000, 120000, 250000, 330000, np.inf]}
-        variables = constant_vars+['MCR (KW)']
-        # variables = ['DWT', 'LBP (M)', 'DRAFT (M)']
-
-    elif shiptype == ShipType.CONTAINER_SHIP:
-        print('container ship filepath used')
-        filepath=Path(r'C:\Users\bnoble\GitHub\ShipDesignDigitalTwin\parameters\Databases\clarksons_data\Container_ship')
-        save_dir = Path(r'C:\Users\bnoble\GitHub\ShipDesignDigitalTwin\knowledge_layer\results\Containership')
-        bins = None
-        variables = constant_vars + ['TEU','MCR (KW)','Vs']
-
-    else:
-        print('ropax filepath used')
-        filepath=Path(r'C:\Users\bnoble\GitHub\ShipDesignDigitalTwin\parameters\Databases\clarksons_data\ROPAX\ROPAX.xlsx')
-        save_dir = Path(r'C:\Users\bnoble\GitHub\ShipDesignDigitalTwin\knowledge_layer\results\RO_Pax')
-        bins = None
-        variables = constant_vars + [ 'Np', 'Nv','Vs']
-
-    return bins,variables, filepath, save_dir
 
 
 def selectors(shiptype: ShipType,
@@ -106,7 +67,7 @@ def selectors(shiptype: ShipType,
     print(f'Start time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
 
     ship_type = shiptype.name
-    bins, variables, filepath, save_dir = get_variables(shiptype=shiptype)
+    bins, variables,_, filepath, save_dir,_ = get_variables(shiptype=shiptype)
 
     print(f'\nDataset: {len(conventional_df)} ships')
     print(f'Variables: {len(variables)} dimensions')
@@ -131,7 +92,7 @@ def selectors(shiptype: ShipType,
             fixed_dimensions=fixed_dimensions,
             selection_metric=selection_criteria,
             selection_strategy='conservative',  # ✅ ADDED: Conservative selection
-            assumptions='moderate',  # ✅ ADDED: Moderate assumption checking
+            assumptions='flexible',  # ✅ ADDED: Moderate assumption checking
             vif_threshold=10.0,  # ✅ ADDED: VIF filtering
             include_regularized=include_regularized,
             use_cv_regularization=use_cv_regularization,
@@ -303,7 +264,7 @@ def selectors(shiptype: ShipType,
 
 def batch_selectors(shiptypes: List[ShipType],
                     data_dict: dict[ShipType, pd.DataFrame],
-                    cv_method: str | None = None,
+                    cv_method: str | None = "stratified",
                     save_base_dir: Path | str = Path('results'),
                     log_file: str | None = None,
                     selection_criteria:str='bic',
@@ -429,7 +390,8 @@ def batch_selectors(shiptypes: List[ShipType],
 def run_overnight_analysis(save_base_dir:Path,
                            selection_criteria:str='bic',
                            outliers:str='percentile',
-                           suffix:str='_v2'):
+
+                           suffix:str='_no_outliers'):
     """
     Example overnight batch processing script.
 
@@ -449,10 +411,23 @@ def run_overnight_analysis(save_base_dir:Path,
     print("Loading datasets...")
     data_dict = {}
 
+    fuel_type_columns = ['MAIN_FUEL', "BUNKER_FUEL"]
+    max_build_year= 1990
+    conventional_fuels = ['DIESEL', 'HFO', 'MDO', 'MGO', 'IFO']
+
+    alt_fuel = ['LNG', 'Methanol', 'Ethanol', 'Ammonia', 'Hydrogen', 'cng', 'ethane']
+    bio_fuels = ['Biofuel']
+
+    alt_fuels = {'Alt_fuel': alt_fuel,
+                 'Biofuel': bio_fuels}
+
     for shiptype in shiptypes:
         try:
-            _, variables, filepath, _ = get_variables(shiptype=shiptype)
-            fleet = getting_alt_fuel_ships(filepath=filepath, ship_type=shiptype.string, outlier_method=outliers)
+            _, variables,_, filepath, _,_ = get_variables(shiptype=shiptype)
+            fleet = getting_alt_fuel_ships(filepath=filepath, shiptype=shiptype.string, outlier_method=outliers,
+                                           fuel_type_columns=fuel_type_columns,
+                                            max_build_year=max_build_year, conventional_fuels=conventional_fuels,
+                                            alt_fuels=alt_fuels, outliers=False)
             data_dict[shiptype] = fleet.processed_data['pure_conventional']
             print(f"✅ {shiptype.name}: {len(data_dict[shiptype])} ships")
         except Exception as e:
@@ -476,9 +451,9 @@ def run_overnight_analysis(save_base_dir:Path,
 if __name__ == '__main__':
     # Run the overnight analysis
 
-    save_base_dir = Path(r'C:\Users\bnoble\GitHub\ShipDesignDigitalTwin\knowledge_layer\results')
+    save_base_dir = Path(r'C:\Users\bnoble\GitHub\AlternativeShipRegression\knowledge_layer\results\new')
 
     run_overnight_analysis(save_base_dir=save_base_dir,
                            selection_criteria='aic',
                            outliers='percentile',
-                           suffix='_v5')
+                           suffix='_sister_ship_new_preproc_3')

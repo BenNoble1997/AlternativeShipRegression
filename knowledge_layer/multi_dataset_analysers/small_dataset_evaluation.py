@@ -72,6 +72,51 @@ class SmallDatasetEvaluator:
         self.verbose = verbose
         self.default_model_params = default_model_params or {}
 
+    # ----------------------------------------------------------------------------
+    # NEW HELPER — add to SmallDatasetEvaluator
+    # ----------------------------------------------------------------------------
+
+    def _resolve_n_params(self,
+                          model_type: str,
+                          X: np.ndarray,
+                          params: Dict) -> int:
+        """
+        Determine the parameter count used by n_params-dependent metrics.
+
+        Random Forests have no classical parameter count, and ensemble
+        averaging means complexity does not scale with ``n_estimators``.
+        The predictor count is used instead, which keeps Random Forest
+        adjusted metrics on the same footing as the parametric models
+        (whose branch already uses the actual feature count) and guarantees
+        the adjusted-R² denominator ``(n - p - 1)`` stays positive for any
+        dataset large enough to evaluate.
+
+        This also removes the ``max_depth=None`` failure mode: sklearn uses
+        ``None`` to mean "grow to full depth", and ``dict.get`` returns a
+        stored ``None`` rather than the fallback, so any arithmetic on
+        ``params.get('max_depth', 10)`` breaks when the key is present.
+
+        :param model_type: Model identifier, e.g. ``'random_forest'``,
+            ``'linear'``, ``'mfp'``.
+        :type model_type: str
+        :param X: Predictor matrix; only its shape is used.
+        :type X: np.ndarray
+        :param params: Merged model parameters (defaults overridden by
+            caller-supplied ``model_params``). Unused for Random Forest but
+            kept in the signature for future model types.
+        :type params: dict
+        :returns: Parameter count for adjusted metrics.
+        :rtype: int
+        """
+        if model_type == 'random_forest':
+            # Predictor count — consistent with the parametric branch and
+            # always < n_samples for any evaluable dataset.
+            return int(X.shape[1]) if X.ndim > 1 else 1
+
+        from knowledge_layer.parametric_regression.parametric_model_factory import ModelFactory
+        X_sample = X[:20] if len(X) > 20 else X
+        return ModelFactory.get_n_parameters(model_type, X_sample)
+
     # ========================================================================
     # STANDARD CV
     # ========================================================================
@@ -81,96 +126,96 @@ class SmallDatasetEvaluator:
                     y: np.ndarray,
                     model_type: str,
                     n_folds: int = 10,
-                    model_params: Optional[Dict] = None) -> Optional[Dict]:  # ✅ ADDED
+                    model_params: dict = None,
+                    reference_scale: float | None = None,
+                    min_coverage: float = 0.8) -> Optional[Dict]:
         """
-        Standard k-fold cross-validation.
+        Single-partition k-fold cross-validation, scored on pooled out-of-fold
+        predictions.
 
-        Single pass through data with k folds.
+        Each observation is held out exactly once, so the k folds together yield
+        one prediction per observation. Metrics are computed once on that pooled
+        vector rather than per fold, because R-squared normalises by the sum of
+        squares of the set it is computed on: on a fold of a handful of samples
+        that denominator is dominated by which observations happened to be grouped
+        together rather than by model quality.
 
-        Parameters
-        ----------
-        X : np.ndarray
-            Predictor variables
-        y : np.ndarray
-            Target variable
-        model_type : str
-            Model type ('linear', 'random_forest', 'mfp', etc.)
-        n_folds : int, default=10
-            Number of folds
-        model_params : dict, optional  # ✅ NEW
-            Model-specific parameters to override defaults
+        No dispersion is returned. A single partition gives a single estimate, and
+        the fold-to-fold standard deviation reported previously measured the
+        unevenness of the shuffle, not uncertainty in the performance estimate.
 
-        Returns
-        -------
-        dict
-            Performance metrics with std dev across folds
+        :param min_coverage: Minimum fraction of observations that must receive a
+            prediction for the result to be returned. A partition in which several
+            folds failed to fit would otherwise be scored on a subset selected by
+            which fits were well conditioned, which is not a random subset.
+        :returns: Metric dictionary, or ``None`` if coverage was insufficient.
         """
         n_samples = len(X)
 
-        # ✅ Merge parameters
         params = self.default_model_params.get(model_type, {}).copy()
         if model_params:
             params.update(model_params)
 
-        # Adjust folds if necessary
-        if n_samples < n_folds:
-            effective_folds = n_samples  # LOO
-        else:
-            effective_folds = n_folds
+        effective_folds = n_samples if n_samples < n_folds else n_folds
 
         if self.verbose:
-            print(f"      Running {effective_folds}-fold CV...")
+            print(f"      Running {effective_folds}-fold CV (pooled)...")
 
-        kf = KFold(n_splits=effective_folds, shuffle=True, random_state=self.random_state)
+        kf = KFold(n_splits=effective_folds, shuffle=True,
+                   random_state=self.random_state)
 
-        fold_metrics = []
+        oof_pred = np.full(n_samples, np.nan)
+        n_failed = 0
 
         for fold_idx, (train_idx, test_idx) in enumerate(kf.split(X)):
             X_train, X_test = X[train_idx], X[test_idx]
-            y_train, y_test = y[train_idx], y[test_idx]
+            y_train = y[train_idx]
 
             try:
-                # ✅ Model-specific fitting with parameters
                 if model_type == 'random_forest':
                     model = RandomForestRegressor(**params)
                     model.fit(X_train, y_train)
-                    y_pred = model.predict(X_test)
-                    n_features = params.get('max_depth', 10)  # Proxy for complexity
+                    oof_pred[test_idx] = model.predict(X_test)
 
                 else:
-                    # Parametric models
                     from knowledge_layer.parametric_regression.parametric_model_factory import ModelFactory
 
                     model, preprocessor = ModelFactory.create_and_fit(
                         model_type, X_train, y_train
                     )
-                    y_pred = ModelFactory.predict(model, preprocessor, X_test, model_type)
-                    n_features = ModelFactory.get_actual_n_features(model_type, X_train)
+                    oof_pred[test_idx] = ModelFactory.predict(
+                        model, preprocessor, X_test, model_type
+                    )
 
-                # Calculate metrics
-                metric_calc = RegressionMetrics(y_test, y_pred)
-                metrics = metric_calc.calculate_all_metrics(n_features)
-
-                fold_metrics.append(metrics)
-
-            except Exception as e:
+            except (ValueError, RuntimeError, np.linalg.LinAlgError) as e:
+                n_failed += 1
                 if self.verbose:
-                    print(f"        Fold {fold_idx + 1} failed: {str(e)[:50]}")
+                    print(f"        Fold {fold_idx + 1} failed: {str(e)[:120]}")
                 continue
 
-        if not fold_metrics:
+        predicted = ~np.isnan(oof_pred)
+        coverage = predicted.sum() / n_samples
+
+        if coverage < min_coverage:
+            if self.verbose:
+                print(f"        → discarded: {coverage:.0%} coverage "
+                      f"({n_failed} folds failed)")
             return None
 
-        # Average metrics
-        avg_metrics = self._average_metrics(fold_metrics)
-        avg_metrics['n_samples'] = n_samples
-        avg_metrics['n_evaluations'] = len(fold_metrics)
-        avg_metrics['method'] = f'{effective_folds}-fold-cv'
+        metric_calc = RegressionMetrics(y[predicted], oof_pred[predicted],
+                                        reference=reference_scale)
+        metrics = metric_calc.calculate_cv_metrics()
+
+        metrics['n_samples'] = n_samples
+        metrics['coverage'] = coverage
+        metrics['n_evaluations'] = 1
+        metrics['method'] = f'{effective_folds}-fold-cv-pooled'
 
         if self.verbose:
-            print(f"        → {len(fold_metrics)}/{effective_folds} folds completed")
+            print(f"        → {effective_folds - n_failed}/{effective_folds} "
+                  f"folds completed, {coverage:.0%} coverage")
 
-        return avg_metrics
+        return metrics
 
     # ========================================================================
     # REPEATED CV
@@ -182,47 +227,28 @@ class SmallDatasetEvaluator:
                     model_type: str,
                     n_folds: int = 5,
                     n_repeats: int = 10,
-                    model_params: Optional[Dict] = None) -> Optional[Dict]:  # ✅ ADDED
+                    model_params: dict = None,
+                    reference_scale: float | None = None,
+                    min_coverage: float = 0.8) -> Optional[Dict]:
         """
-        Repeated k-fold cross-validation.
+        Repeated k-fold cross-validation, scored on pooled out-of-fold predictions.
 
-        Performs k-fold CV multiple times with different random splits
-        to obtain more stable performance estimates.
+        One metric set is produced per repeat, computed on the full out-of-fold
+        vector of that partition. The dispersion returned is therefore the spread
+        across partitions: it quantifies how much the estimate depends on which
+        observations were grouped together, not how much it would change under a
+        different sample of vessels.
 
-        Parameters
-        ----------
-        X : np.ndarray
-            Predictor variables
-        y : np.ndarray
-            Target variable
-        model_type : str
-            Model type ('linear', 'random_forest', 'mfp', etc.)
-        n_folds : int, default=5
-            Number of folds per repetition
-        n_repeats : int, default=10
-            Number of repetitions
-        model_params : dict, optional  # ✅ NEW
-            Model-specific parameters to override defaults
-
-        Returns
-        -------
-        dict
-            Performance metrics averaged across all folds×repeats
-
-        Notes
-        -----
-        - Total evaluations = n_folds × n_repeats
-        - More stable than single CV run
-        - Each sample appears in test set multiple times
+        :param min_coverage: Minimum fraction of observations that must receive a
+            prediction for a repeat to be retained.
+        :returns: Metrics aggregated over surviving repeats, or ``None``.
         """
         n_samples = len(X)
 
-        # ✅ Merge parameters
         params = self.default_model_params.get(model_type, {}).copy()
         if model_params:
             params.update(model_params)
 
-        # Adjust folds if necessary
         if n_samples < n_folds:
             effective_folds = max(2, n_samples // 2)
         else:
@@ -230,143 +256,139 @@ class SmallDatasetEvaluator:
 
         if self.verbose:
             print(f"      Running {effective_folds}-fold CV × {n_repeats} repeats "
-                  f"({effective_folds * n_repeats} evaluations)...")
+                  f"({n_repeats} pooled evaluations)...")
 
-        all_metrics = []
+        repeat_metrics = []
 
         for repeat_idx in range(n_repeats):
-            kf = KFold(
-                n_splits=effective_folds,
-                shuffle=True,
-                random_state=self.random_state + repeat_idx
-            )
+            kf = KFold(n_splits=effective_folds, shuffle=True,
+                       random_state=self.random_state + repeat_idx)
+
+            oof_pred = np.full(n_samples, np.nan)
 
             for fold_idx, (train_idx, test_idx) in enumerate(kf.split(X)):
                 X_train, X_test = X[train_idx], X[test_idx]
-                y_train, y_test = y[train_idx], y[test_idx]
+                y_train = y[train_idx]
 
                 try:
-                    # ✅ Model-specific fitting with parameters
                     if model_type == 'random_forest':
                         model = RandomForestRegressor(**params)
                         model.fit(X_train, y_train)
-                        y_pred = model.predict(X_test)
-                        n_features = params.get('max_depth', 10)
+                        oof_pred[test_idx] = model.predict(X_test)
 
                     else:
-                        # Parametric models
                         from knowledge_layer.parametric_regression.parametric_model_factory import ModelFactory
 
                         model, preprocessor = ModelFactory.create_and_fit(
                             model_type, X_train, y_train
                         )
-                        y_pred = ModelFactory.predict(model, preprocessor, X_test, model_type)
-                        n_features = ModelFactory.get_actual_n_features(model_type, X_train)
+                        oof_pred[test_idx] = ModelFactory.predict(
+                            model, preprocessor, X_test, model_type
+                        )
 
-                    # Calculate metrics
-                    metric_calc = RegressionMetrics(y_test, y_pred)
-                    metrics = metric_calc.calculate_all_metrics(n_features)
-
-                    all_metrics.append(metrics)
-
-                except Exception as e:
+                except (ValueError, RuntimeError, np.linalg.LinAlgError) as e:
                     if self.verbose:
-                        print(f"        Repeat {repeat_idx + 1}, fold {fold_idx + 1} failed: "
-                              f"{str(e)[:50]}")
+                        print(f"        Repeat {repeat_idx + 1}, fold {fold_idx + 1} "
+                              f"failed: {str(e)[:120]}")
                     continue
 
-        if not all_metrics:
+            predicted = ~np.isnan(oof_pred)
+            coverage = predicted.sum() / n_samples
+
+            if coverage < min_coverage:
+                if self.verbose:
+                    print(f"        Repeat {repeat_idx + 1} discarded "
+                          f"({coverage:.0%} coverage)")
+                continue
+
+            metric_calc = RegressionMetrics(y[predicted], oof_pred[predicted],
+                                            reference=reference_scale)
+            metrics = metric_calc.calculate_cv_metrics()
+            metrics['coverage'] = coverage
+            repeat_metrics.append(metrics)
+
+        if not repeat_metrics:
             return None
 
-        # Average metrics
-        avg_metrics = self._average_metrics(all_metrics)
+        avg_metrics = self._average_metrics(repeat_metrics)
         avg_metrics['n_samples'] = n_samples
-        avg_metrics['n_evaluations'] = len(all_metrics)
-        avg_metrics['method'] = f'{effective_folds}-fold-cv-{n_repeats}x'
+        avg_metrics['n_evaluations'] = len(repeat_metrics)
+        avg_metrics['method'] = f'{effective_folds}x{n_repeats}-repeated-cv-pooled'
 
         if self.verbose:
-            print(f"        → {len(all_metrics)}/{effective_folds * n_repeats} evaluations completed")
+            print(f"        → {len(repeat_metrics)}/{n_repeats} repeats completed")
 
         return avg_metrics
 
-    # ========================================================================
-    # BOOTSTRAP .632+
-    # ========================================================================
+    # ----------------------------------------------------------------------------
+    # UPDATED: bootstrap_632_plus
+    # ----------------------------------------------------------------------------
 
     def bootstrap_632_plus(self,
                            X: np.ndarray,
                            y: np.ndarray,
                            model_type: str,
                            n_bootstraps: int = 100,
-                           model_params: Optional[Dict] = None) -> Optional[Dict]:
+                           model_params: dict = None,
+                            reference_scale:float|None=None) -> dict:
         """
         Bootstrap .632+ evaluation with bias correction.
 
-        **Works for both parametric and Random Forest models.**
+        Works for both parametric and Random Forest models.
 
-        Parameters
-        ----------
-        X : np.ndarray
-            Predictor data
-        y : np.ndarray
-            Target data
-        model_type : str
-            Model type ('linear', 'random_forest', 'mfp', etc.)
-        n_bootstraps : int, default=100
-            Number of bootstrap samples
-        model_params : dict, optional
-            Model-specific parameters
+        Bootstrap training error is optimistically biased (samples repeat)
+        while out-of-bag error is pessimistically biased (test sets are
+        small). The .632+ estimator blends them with a weight driven by the
+        relative overfitting rate:
 
-        Returns
-        -------
-        dict or None
-            Metrics with .632+ correction
+        ``err_632+ = w · err_oob + (1 − w) · err_train`` where
+        ``w = 0.632 / (1 − 0.368 · R)``.
 
-        Notes
-        -----
-        **Bootstrap .632+ Concept:**
-
-        Bootstrap training error is optimistically biased (too low) because
-        samples are repeated. OOB error is pessimistically biased (too high)
-        because test sets are small. The .632+ estimator finds optimal weight
-        between them based on relative overfitting rate.
-
-        Formula: err_632+ = w × err_oob + (1-w) × err_train
-        where w = 0.632 / (1 - 0.368 × R)
-        and R is relative overfitting rate
+        :param X: Predictor data.
+        :type X: np.ndarray
+        :param y: Target data.
+        :type y: np.ndarray
+        :param model_type: Model type (``'linear'``, ``'random_forest'``,
+            ``'mfp'``, ...).
+        :type model_type: str
+        :param n_bootstraps: Number of bootstrap resamples.
+        :type n_bootstraps: int
+        :param model_params: Model-specific parameter overrides. May contain
+            ``None`` values (e.g. sklearn's ``max_depth=None``); these are
+            handled safely.
+        :type model_params: dict, optional
+        :returns: Metrics with .632+ correction, or ``None`` if no bootstrap
+            sample produced enough OOB observations.
+        :rtype: dict or None
         """
         n_samples = len(X)
 
         if self.verbose:
             print(f"      Running Bootstrap .632+ ({n_bootstraps} samples)...")
 
-        # ✅ Merge parameters
+        # Merge parameters (caller overrides defaults)
         params = self.default_model_params.get(model_type, {}).copy()
         if model_params:
             params.update(model_params)
 
-        # Get n_parameters for metrics calculation
-        if model_type == 'random_forest':
-            # RF doesn't have traditional parameter count
-            # Use a proxy based on complexity
-            n_params = params.get('max_depth', 10) * params.get('n_estimators', 100)
-        else:
-            # For parametric models, get actual parameter count
-            from knowledge_layer.parametric_regression.parametric_model_factory import ModelFactory
-            # Use a small sample to estimate parameter count
-            if len(X) > 20:
-                X_sample = X[:20]
-            else:
-                X_sample = X
-            n_params = ModelFactory.get_n_parameters(model_type, X_sample)
+        # ✅ FIX: None-safe parameter count on a consistent footing with the
+        #    parametric branch. Previously:
+        #        params.get('max_depth', 10) * params.get('n_estimators', 100)
+        #    which raised TypeError for max_depth=None and could exceed
+        #    n_samples, corrupting adjusted metrics.
+        n_params = self._resolve_n_params(model_type, X, params)
+
+        # ✅ Seeded resampling → reproducible bootstrap results across reruns
+        rng = np.random.RandomState(self.random_state)
 
         oob_metrics_list = []
         train_metrics_list = []
 
         for i in range(n_bootstraps):
-            # Bootstrap sample
-            bootstrap_idx = np.random.choice(n_samples, size=n_samples, replace=True)
-            oob_idx = np.array([j for j in range(n_samples) if j not in bootstrap_idx])
+            bootstrap_idx = rng.choice(n_samples, size=n_samples, replace=True)
+            # ✅ O(n log n) instead of O(n²) list-membership scan
+            oob_idx = np.setdiff1d(np.arange(n_samples), bootstrap_idx,
+                                   assume_unique=False)
 
             if len(oob_idx) < 5:  # Need minimum OOB samples
                 continue
@@ -377,49 +399,35 @@ class SmallDatasetEvaluator:
             y_oob = y[oob_idx]
 
             try:
-                # ✅ Model-specific fitting with parameters
                 if model_type == 'random_forest':
                     model = RandomForestRegressor(**params)
                     model.fit(X_boot, y_boot)
-
-                    # Training predictions
                     y_train_pred = model.predict(X_boot)
-                    # OOB predictions
                     y_oob_pred = model.predict(X_oob)
 
                 else:
-                    # Parametric models
                     from knowledge_layer.parametric_regression.parametric_model_factory import ModelFactory
 
                     model, preprocessor = ModelFactory.create_and_fit(
                         model_type, X_boot, y_boot
                     )
-
-                    # Training predictions
                     y_train_pred = ModelFactory.predict(model, preprocessor, X_boot, model_type)
-                    # OOB predictions
                     y_oob_pred = ModelFactory.predict(model, preprocessor, X_oob, model_type)
 
-                # Calculate metrics
-                # Training metrics
-                train_calc = RegressionMetrics(y_boot, y_train_pred)
-                train_metrics = train_calc.calculate_predictive_metrics(n_params)
-                train_metrics_list.append(train_metrics)
+                train_calc = RegressionMetrics(y_boot, y_train_pred, reference=reference_scale)
+                train_metrics_list.append(train_calc.calculate_predictive_metrics(n_params))
 
-                # OOB metrics
-                oob_calc = RegressionMetrics(y_oob, y_oob_pred)
-                oob_metrics = oob_calc.calculate_predictive_metrics(n_params)
-                oob_metrics_list.append(oob_metrics)
+                oob_calc = RegressionMetrics(y_oob, y_oob_pred, reference=reference_scale)
+                oob_metrics_list.append(oob_calc.calculate_predictive_metrics(n_params))
 
             except (ValueError, RuntimeError, np.linalg.LinAlgError) as e:
-                if self.verbose and i < 5:  # Only print first few errors
+                if self.verbose and i < 5:
                     print(f"        Bootstrap {i + 1} failed: {str(e)[:50]}")
                 continue
 
         if not oob_metrics_list:
             return None
 
-        # Calculate .632+ correction
         result = self._calculate_632_plus(train_metrics_list, oob_metrics_list, X, y, n_params)
 
         if self.verbose:
@@ -520,20 +528,39 @@ class SmallDatasetEvaluator:
         return corrected
 
     def _average_metrics(self, metrics_list: List[Dict]) -> Dict:
-        """Average metrics across samples."""
+        """
+        Average metric dictionaries across repeats or bootstrap replicates.
+
+        Keys are taken from the dictionaries themselves rather than from a fixed
+        list, so the aggregation follows whatever metric set the caller produced.
+        Non-numeric and bookkeeping entries are skipped.
+
+        Standard deviations use ``ddof=1``: the values being aggregated are a
+        sample of possible partitions, not the population of them.
+        """
+        if not metrics_list:
+            return {}
+
+        skip = {'n_samples', 'n_features', 'n_evaluations', 'method', 'coverage'}
+        keys = [k for k in metrics_list[0]
+                if k not in skip and isinstance(metrics_list[0][k], (int, float, np.floating))]
+
         avg_metrics = {}
 
-        metric_names = ['r2', 'adj_r2', 'rrmse', 'mape', 'mae', 'rmse']
-
-        for metric in metric_names:
-            values = [m[metric] for m in metrics_list
-                      if not np.isnan(m.get(metric, np.nan))]
+        for key in keys:
+            values = [m[key] for m in metrics_list
+                      if key in m and not np.isnan(m[key])]
 
             if values:
-                avg_metrics[metric] = np.mean(values)
-                avg_metrics[f'{metric}_std'] = np.std(values)
+                avg_metrics[key] = float(np.mean(values))
+                avg_metrics[f'{key}_std'] = float(np.std(values, ddof=1)) if len(values) > 1 else 0.0
             else:
-                avg_metrics[metric] = np.nan
-                avg_metrics[f'{metric}_std'] = np.nan
+                avg_metrics[key] = np.nan
+                avg_metrics[f'{key}_std'] = np.nan
+
+        if 'coverage' in metrics_list[0]:
+            avg_metrics['mean_coverage'] = float(
+                np.mean([m['coverage'] for m in metrics_list])
+            )
 
         return avg_metrics

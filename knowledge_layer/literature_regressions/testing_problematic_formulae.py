@@ -278,7 +278,7 @@ if __name__ == "__main__":
 
 
     fleet = getting_alt_fuel_ships(filepath=filepath,
-                                   ship_type=ship_type)
+                                   shiptype=ship_type)
 
     CONVENTIONAL_DATA = fleet.processed_data['pure_conventional']
     CONVENTIONAL_MATCHED = fleet.processed_data['matched_dwt3.5_speed']

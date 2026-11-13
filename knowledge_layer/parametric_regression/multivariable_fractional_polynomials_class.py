@@ -1,4 +1,3 @@
-
 """
 Multivariable Fractional Polynomials (MFP) — Core Implementation
 =================================================================
@@ -16,6 +15,33 @@ Royston & Sauerbrei (2008) algorithm:
    hierarchy: FP2 > FP1 > Linear > Exclude.
 3. **Cycle until convergence** — repeat BE → FSP until two consecutive
    cycles produce identical transformations.
+
+Controlling the Permitted FP Degree
+-------------------------------------
+The ``max_degree`` argument restricts the *family* of functions the
+algorithm is allowed to select from:
+
+- ``max_degree=2`` (default) — the standard MFP family
+  {excluded, linear, FP1, FP2}.
+- ``max_degree=1`` — the family {excluded, linear, FP1}.  Each retained
+  variable contributes exactly one regression term, giving a single
+  monotone or single-turning-point curve.
+- ``max_degree=0`` — the family {excluded, linear}.  This reduces MFP to
+  backward elimination on untransformed predictors, useful as a
+  reference model.
+
+This mirrors the ``df`` option of the Stata ``mfp`` command and the R
+``mfp`` package, where ``df=1`` permits only a linear term, ``df=2``
+permits FP1, and ``df=4`` permits FP2.
+
+Restricting the degree is not merely a matter of skipping the last test.
+The closed test procedure controls the family-wise error rate by
+comparing every candidate against *the most complex model in the
+permitted family*.  When FP2 is excluded from the family, the best FP1
+becomes that reference model, and the hierarchy shortens accordingly.
+Keeping FP2 as the reference while refusing to select it would make the
+exclusion and linearity decisions systematically stricter than the
+declared family justifies.  See :meth:`MFPRegressor._closed_test_procedure`.
 
 :class:`MFPRegressor` is *not* called directly by analysis code.  It is
 instantiated and called by
@@ -79,10 +105,12 @@ Pragmatic Approach to Regression Analysis Based on Fractional Polynomials
 for Modelling Continuous Variables*. Wiley.
 """
 
+import itertools
+import warnings
+
 import numpy as np
 from sklearn.linear_model import LinearRegression
 from scipy import stats
-import warnings
 
 
 class MFPRegressor:
@@ -116,6 +144,40 @@ class MFPRegressor:
         is used.
     :type powers: list[float], optional
 
+    :param max_degree: Highest fractional polynomial degree the closed
+        test is permitted to select.
+
+        - ``2`` (default) — the full family {excluded, linear, FP1, FP2}.
+        - ``1`` — {excluded, linear, FP1}; at most one term per variable.
+        - ``0`` — {excluded, linear}; backward elimination only, no
+          transformation search.
+
+        The permitted family determines the reference model used in
+        every closed test, not just the set of returned transformations
+        (see :meth:`_closed_test_procedure`).
+
+        ``max_degree=1`` requires ``df_accounting='royston'``; see that
+        parameter for why.
+    :type max_degree: int
+
+    :param df_accounting: How the degrees of freedom consumed by a
+        fractional polynomial term are charged in the likelihood ratio
+        tests.
+
+        - ``'terms'`` (default) — one degree of freedom per fitted
+          regression term, so FP1 costs 1 and FP2 costs 2.  This is the
+          behaviour of earlier versions of this class and is retained as
+          the default for reproducibility of existing results.
+        - ``'royston'`` — FP1 costs 2 and FP2 costs 4, the additional
+          degrees of freedom accounting for the powers being *selected*
+          from :attr:`powers` rather than fixed in advance (Royston &
+          Sauerbrei, 2008, §4.10).  Because the powers are chosen by
+          minimising RSS over the grid, the observed improvement is
+          optimistically biased; charging only the term count makes the
+          procedure anti-conservative.
+
+    :type df_accounting: str
+
     :param max_cycles: Maximum number of BE → FSP cycles before stopping,
         regardless of whether convergence has been detected.  Defaults
         to 20.
@@ -133,7 +195,15 @@ class MFPRegressor:
         - ``transform_type`` (*str*): one of ``'linear'``, ``'fp1'``,
           ``'fp2'``, ``'excluded'``.
         - ``powers`` (*list[float]*): transformation powers.  Empty
-          list for excluded variables.
+          list for excluded variables.  An ``'fp2'`` entry carries two
+          powers; when the two are equal the repeated-power form
+          :math:`x^p, x^p \\ln x` is generated.  For backward
+          compatibility a single-element ``'fp2'`` power list is
+          normalised to ``[p, p]`` on input.
+
+        The structure is validated against :attr:`max_degree`, so a
+        fixed FP2 structure cannot be silently fitted by a regressor
+        declared as FP1-only.
 
     :type fixed_transforms: dict, optional
 
@@ -141,35 +211,35 @@ class MFPRegressor:
         BE and FSP step.  Defaults to ``False``.
     :type verbose: bool
 
-    :ivar transforms\_: Final transformation assigned to each variable
+    :ivar transforms\\_: Final transformation assigned to each variable
         after fitting.  Format: ``{var_idx: (transform_type, powers)}``.
         ``None`` before :meth:`fit` is called.
-    :vartype transforms\_: dict or None
+    :vartype transforms\\_: dict or None
 
-    :ivar feature_names_in\_: Names of input features in the order they
+    :ivar feature_names_in\\_: Names of input features in the order they
         appear in the columns of ``X``.  Set during :meth:`fit`.
-    :vartype feature_names_in\_: list[str] or None
+    :vartype feature_names_in\\_: list[str] or None
 
-    :ivar model\_: Fitted :class:`~sklearn.linear_model.LinearRegression`
+    :ivar model\\_: Fitted :class:`~sklearn.linear_model.LinearRegression`
         on the transformed feature space.  ``None`` before fitting.
-    :vartype model\_: LinearRegression or None
+    :vartype model\\_: LinearRegression or None
 
-    :ivar coef\_: Coefficient array of :attr:`model_`, shape
+    :ivar coef\\_: Coefficient array of :attr:`model_`, shape
         ``(n_transformed_features,)``.
-    :vartype coef\_: numpy.ndarray or None
+    :vartype coef\\_: numpy.ndarray or None
 
-    :ivar intercept\_: Intercept of :attr:`model_`.
-    :vartype intercept\_: float or None
+    :ivar intercept\\_: Intercept of :attr:`model_`.
+    :vartype intercept\\_: float or None
 
-    :ivar n_cycles\_: Number of BE → FSP cycles completed before
+    :ivar n_cycles\\_: Number of BE → FSP cycles completed before
         convergence (or ``max_cycles`` was reached).  Set to 0 when
         ``fixed_transforms`` is used.
-    :vartype n_cycles\_: int
+    :vartype n_cycles\\_: int
 
-    :ivar convergence_history\_: List of transformation dicts captured at
+    :ivar convergence_history\\_: List of transformation dicts captured at
         the end of each cycle.  Useful for diagnosing convergence
         behaviour.
-    :vartype convergence_history\_: list[dict]
+    :vartype convergence_history\\_: list[dict]
 
     :cvar DEFAULT_POWERS: Standard MFP power set from Royston & Sauerbrei.
     :vartype DEFAULT_POWERS: list[float]
@@ -178,20 +248,68 @@ class MFPRegressor:
     # Standard MFP power set from Royston & Sauerbrei
     DEFAULT_POWERS = [-3,-2.5,-2,-1.5, -1, -0.5,-1/3, 0, 0.5,1/3, 1,1.5,2,2.5,3]
 
+    #: Regression terms generated by each transformation type.
+    N_TERMS = {'excluded': 0, 'linear': 1, 'fp1': 1, 'fp2': 2}
+
+    #: Degrees of freedom charged per transformation type under each
+    #: accounting convention.  'terms' charges the fitted terms only;
+    #: 'royston' additionally charges one df per power selected from the
+    #: grid, giving the 1 / 2 / 4 df sequence used in the reference text.
+    DF_COST = {
+        'terms':   {'excluded': 0, 'linear': 1, 'fp1': 1, 'fp2': 2},
+        'royston': {'excluded': 0, 'linear': 1, 'fp1': 2, 'fp2': 4},
+    }
+
     def __init__(self,
                  alpha1: float = 0.05,
                  alpha2: float = 0.05,
                  powers: list[float]|None = None,
                  max_cycles: int = 20,
-                fixed_transforms: dict = None,
+                 fixed_transforms: dict = None,
+                 max_degree: int = 2,
+                 df_accounting: str = 'terms',
                  verbose: bool = False):
+
+        if max_degree not in (0, 1, 2):
+            raise ValueError(
+                f"max_degree must be 0 (linear only), 1 (up to FP1) or "
+                f"2 (up to FP2), got {max_degree}"
+            )
+        if df_accounting not in self.DF_COST:
+            raise ValueError(
+                f"df_accounting must be one of {sorted(self.DF_COST)}, "
+                f"got {df_accounting!r}"
+            )
+
+        if max_degree == 1 and df_accounting == 'terms':
+            # Linear and FP1 both contribute exactly one regression term,
+            # so under term-count accounting the linear-vs-FP1 test has
+            # zero degrees of freedom, always returns p = 1, and the
+            # model silently collapses to max_degree=0.  The comparison
+            # is genuinely a one-df test: the free quantity is the power
+            # itself, which only 'royston' accounting charges for.
+            raise ValueError(
+                "max_degree=1 requires df_accounting='royston'. Linear and "
+                "FP1 contribute the same number of regression terms, so "
+                "under df_accounting='terms' the linear-vs-FP1 likelihood "
+                "ratio test has zero degrees of freedom and FP1 can never "
+                "be selected."
+            )
 
         self.alpha1 = alpha1
         self.alpha2 = alpha2
         self.powers = powers if powers is not None else self.DEFAULT_POWERS
         self.max_cycles = max_cycles
-        self.fixed_transforms = fixed_transforms
+        self.max_degree = max_degree
+        self.df_accounting = df_accounting
+        self.fixed_transforms = (
+            self._normalise_transforms(fixed_transforms)
+            if fixed_transforms is not None else None
+        )
         self.verbose = verbose
+
+        if self.fixed_transforms is not None:
+            self._validate_against_max_degree(self.fixed_transforms)
 
         # Will be set during fit
         self.transforms_ = None
@@ -220,8 +338,8 @@ class MFPRegressor:
         2. **Backward Elimination** — test each variable for significance
            using the LRT; remove those with p > :attr:`alpha1`.
         3. **Function Selection Procedure** — for each retained variable,
-           run the three-step closed test to select the best
-           transformation.
+           run the closed test to select the best transformation from the
+           family permitted by :attr:`max_degree`.
         4. Check convergence.  If transformations are unchanged relative
            to the previous cycle, stop.
         5. Rotate the FSP start index for the next cycle to prevent
@@ -295,7 +413,11 @@ class MFPRegressor:
             print(f"Samples: {n_samples}")
             print(f"Alpha1 (BE): {self.alpha1}")
             print(f"Alpha2 (FSP): {self.alpha2}")
-            print(f"Powers: {self.powers}")
+            print(f"Max FP degree: {self.max_degree} "
+                  f"(permitted family: {self._family_description()})")
+            print(f"df accounting: {self.df_accounting}")
+            if self.max_degree > 0:
+                print(f"Powers: {self.powers}")
             print("=" * 80)
 
         # Initialize all variables as linear
@@ -449,7 +571,10 @@ class MFPRegressor:
 
         model_full = LinearRegression().fit(X_transformed, y)
         rss_full = self._calculate_rss(model_full, X_transformed, y)
-        n_params_full = X_transformed.shape[1] + 1  # +1 for intercept
+        # Degrees of freedom, not column count: under
+        # df_accounting='royston' a selected FP term costs more than the
+        # one column it contributes.
+        n_params_full = self._model_df(current_transforms) + 1
 
         # Calculate p-values for each variable using likelihood ratio test
         p_values = {}
@@ -471,7 +596,7 @@ class MFPRegressor:
                 X_without = self._apply_transforms(X, transforms_without)
                 model_without = LinearRegression().fit(X_without, y)
                 rss_without = self._calculate_rss(model_without, X_without, y)
-                n_params_without = X_without.shape[1] + 1
+                n_params_without = self._model_df(transforms_without) + 1
 
             # Likelihood ratio test
             p_value = self._likelihood_ratio_test(
@@ -570,36 +695,64 @@ class MFPRegressor:
                     power_str = self._format_power(powers[0])
                     print(f"    → Selected: FP1 ({power_str})")
                 elif transform_type == 'fp2':
-                    if len(powers) == 1:
+                    if powers[0] == powers[1]:
                         power_str = self._format_power(powers[0]) + " (repeated)"
                     else:
                         power_str = f"{self._format_power(powers[0])}, {self._format_power(powers[1])}"
                     print(f"    → Selected: FP2 ({power_str})")
+                elif transform_type == 'excluded':
+                    print(f"    → Selected: EXCLUDED")
 
         return updated_transforms
 
     def _closed_test_procedure(self, X, y, var_idx, current_transforms):
         """
-        Apply the three-step closed test hierarchy for a single variable.
+        Apply the closed test hierarchy for a single variable.
 
-        The closed test ensures the family-wise error rate is controlled
-        when making multiple simultaneous comparisons.  The hierarchy is:
+        The closed test controls the family-wise error rate across the
+        several comparisons made for one variable by testing every
+        candidate against a single **reference model**: the most complex
+        function in the permitted family.  Which function that is depends
+        on :attr:`max_degree`, so the hierarchy adapts as follows.
 
-        **Test 1 — Null vs best FP2** (at :attr:`alpha1`):
-            If the variable adds no significant improvement over a model
-            without it, it is excluded.
+        ``max_degree = 2`` (reference model: best FP2)
 
-        **Test 2 — Linear vs best FP2** (at :attr:`alpha2`):
-            If a linear term is not significantly worse than the best FP2,
-            use linear (prefer parsimony).
+            **Test 1 — Null vs best FP2** (at :attr:`alpha1`):
+                If the variable adds no significant improvement over a
+                model without it, it is excluded.
 
-        **Test 3 — Best FP1 vs best FP2** (at :attr:`alpha2`):
-            If FP1 is not significantly worse than FP2, use the simpler
-            FP1.  Otherwise use FP2.
+            **Test 2 — Linear vs best FP2** (at :attr:`alpha2`):
+                If a linear term is not significantly worse than the best
+                FP2, use linear (prefer parsimony).
 
-        At each test, the "other variables" are held fixed in their
+            **Test 3 — Best FP1 vs best FP2** (at :attr:`alpha2`):
+                If FP1 is not significantly worse than FP2, use the
+                simpler FP1.  Otherwise use FP2.
+
+        ``max_degree = 1`` (reference model: best FP1)
+
+            Tests 1 and 2 are performed against the best FP1 instead of
+            the best FP2, and Test 3 does not exist because the two
+            candidates it discriminates between are no longer both in the
+            family.
+
+        ``max_degree = 0`` (reference model: linear)
+
+            A single test of null vs linear at :attr:`alpha1`.  The
+            procedure degenerates to significance testing of the
+            untransformed variable.
+
+        Substituting the reference model rather than merely suppressing
+        Test 3 is what keeps the procedure coherent.  Testing exclusion
+        against an FP2 that the algorithm is forbidden to select would
+        borrow evidence from outside the declared family and would make
+        both the exclusion and the linearity decisions stricter than the
+        nominal levels imply.
+
+        At each test, the other variables are held fixed in their
         *current* transformations (from ``current_transforms``), and
-        models are compared using the LRT.
+        models are compared with the LRT.  Degrees of freedom are charged
+        according to :attr:`df_accounting`.
 
         :param X: Raw predictor matrix.
         :type X: numpy.ndarray
@@ -624,76 +777,110 @@ class MFPRegressor:
         X_others = self._apply_transforms(X, other_transforms)
 
         n_samples = len(y)
+        n_others = X_others.shape[1]
 
-        # Find best FP2 model
-        best_fp2_powers, best_fp2_rss = self._find_best_fp2(x_var, y, X_others)
-        n_params_fp2 = X_others.shape[1] + len(best_fp2_powers) + 1  # +1 for intercept
-
-        # TEST 1: NULL vs best FP2 (at alpha1)
-        # Model without this variable
-        if X_others.shape[1] > 0:
+        # ---- Null model: this variable absent -------------------------
+        if n_others > 0:
             model_null = LinearRegression().fit(X_others, y)
             rss_null = self._calculate_rss(model_null, X_others, y)
         else:
             # Intercept-only model
             rss_null = np.sum((y - y.mean()) ** 2)
 
-        n_params_null = X_others.shape[1] + 1
+        df_others = self._model_df(other_transforms)
+        df_null = df_others + 1  # +1 for intercept
 
-        p_value_null_vs_fp2 = self._likelihood_ratio_test(
-            rss_null, best_fp2_rss,
-            n_params_null, n_params_fp2,
-            n_samples
+        # ---- Linear candidate (always in the family) -------------------
+        rss_linear = self._calculate_fp_rss(x_var, y, X_others, [1])
+        df_linear = df_others + self._df_cost('linear') + 1
+
+        # ---- Degree 0: linear-only family ------------------------------
+        if self.max_degree == 0:
+            p_value = self._likelihood_ratio_test(
+                rss_null, rss_linear, df_null, df_linear, n_samples
+            )
+            if p_value > self.alpha1:
+                if self.verbose:
+                    print(f"      Test 1: NULL vs LINEAR: p={p_value:.4f} "
+                          f"> {self.alpha1} → EXCLUDE")
+                return ('excluded', [])
+            if self.verbose:
+                print(f"      Test 1: NULL vs LINEAR: p={p_value:.4f} "
+                      f"≤ {self.alpha1} → Use LINEAR")
+            return ('linear', [1])
+
+        # ---- Reference model: most complex function in the family ------
+        if self.max_degree == 1:
+            best_fp1_power, rss_ref = self._find_best_fp1(x_var, y, X_others)
+            reference = ('fp1', [best_fp1_power])
+            df_ref = df_others + self._df_cost('fp1') + 1
+            ref_label = 'FP1'
+        else:
+            best_fp2_powers, rss_ref = self._find_best_fp2(x_var, y, X_others)
+            reference = ('fp2', best_fp2_powers)
+            df_ref = df_others + self._df_cost('fp2') + 1
+            ref_label = 'FP2'
+
+        # ---- TEST 1: NULL vs reference (at alpha1) ---------------------
+        p_value_null = self._likelihood_ratio_test(
+            rss_null, rss_ref, df_null, df_ref, n_samples
         )
 
-        if p_value_null_vs_fp2 > self.alpha1:
+        if p_value_null > self.alpha1:
             # Variable not significant → exclude
             if self.verbose:
-                print(f"      Test 1: NULL vs FP2: p={p_value_null_vs_fp2:.4f} > {self.alpha1} → EXCLUDE")
+                print(f"      Test 1: NULL vs {ref_label}: p={p_value_null:.4f} "
+                      f"> {self.alpha1} → EXCLUDE")
             return ('excluded', [])
 
         if self.verbose:
-            print(f"      Test 1: NULL vs FP2: p={p_value_null_vs_fp2:.4f} ≤ {self.alpha1} → Keep variable")
+            print(f"      Test 1: NULL vs {ref_label}: p={p_value_null:.4f} "
+                  f"≤ {self.alpha1} → Keep variable")
 
-        # TEST 2: best FP2 vs Linear (at alpha2)
-        linear_rss = self._calculate_fp_rss(x_var, y, X_others, [1])
-        n_params_linear = X_others.shape[1] + 1 + 1  # +1 for linear term, +1 for intercept
-
-        p_value_linear_vs_fp2 = self._likelihood_ratio_test(
-            linear_rss, best_fp2_rss,
-            n_params_linear, n_params_fp2,
-            n_samples
+        # ---- TEST 2: Linear vs reference (at alpha2) -------------------
+        p_value_linear = self._likelihood_ratio_test(
+            rss_linear, rss_ref, df_linear, df_ref, n_samples
         )
 
-        if p_value_linear_vs_fp2 > self.alpha2:
+        if p_value_linear > self.alpha2:
             # Linear is sufficient
             if self.verbose:
-                print(f"      Test 2: Linear vs FP2: p={p_value_linear_vs_fp2:.4f} > {self.alpha2} → Use LINEAR")
+                print(f"      Test 2: Linear vs {ref_label}: "
+                      f"p={p_value_linear:.4f} > {self.alpha2} → Use LINEAR")
             return ('linear', [1])
 
         if self.verbose:
-            print(f"      Test 2: Linear vs FP2: p={p_value_linear_vs_fp2:.4f} ≤ {self.alpha2} → Need non-linear")
+            print(f"      Test 2: Linear vs {ref_label}: p={p_value_linear:.4f} "
+                  f"≤ {self.alpha2} → Need non-linear")
 
-        # TEST 3: best FP2 vs best FP1 (at alpha2)
-        best_fp1_power, best_fp1_rss = self._find_best_fp1(x_var, y, X_others)
-        n_params_fp1 = X_others.shape[1] + 1 + 1  # +1 for FP1 term, +1 for intercept
+        # With FP1 as the reference there is nothing further to
+        # discriminate: the family is exhausted.
+        if self.max_degree == 1:
+            if self.verbose:
+                power_str = self._format_power(reference[1][0])
+                print(f"      → Use FP1 ({power_str})")
+            return reference
+
+        # ---- TEST 3: best FP1 vs best FP2 (at alpha2) ------------------
+        best_fp1_power, rss_fp1 = self._find_best_fp1(x_var, y, X_others)
+        df_fp1 = df_others + self._df_cost('fp1') + 1
 
         p_value_fp1_vs_fp2 = self._likelihood_ratio_test(
-            best_fp1_rss, best_fp2_rss,
-            n_params_fp1, n_params_fp2,
-            n_samples
+            rss_fp1, rss_ref, df_fp1, df_ref, n_samples
         )
 
         if p_value_fp1_vs_fp2 <= self.alpha2:
             # FP1 is significantly worse than FP2 → use FP2
             if self.verbose:
-                print(f"      Test 3: FP1 vs FP2: p={p_value_fp1_vs_fp2:.4f} ≤ {self.alpha2} → Use FP2")
-            return ('fp2', best_fp2_powers)
-        else:
-            # FP1 is not significantly worse → use simpler FP1
-            if self.verbose:
-                print(f"      Test 3: FP1 vs FP2: p={p_value_fp1_vs_fp2:.4f} > {self.alpha2} → Use FP1")
-            return ('fp1', [best_fp1_power])
+                print(f"      Test 3: FP1 vs FP2: p={p_value_fp1_vs_fp2:.4f} "
+                      f"≤ {self.alpha2} → Use FP2")
+            return reference
+
+        # FP1 is not significantly worse → use simpler FP1
+        if self.verbose:
+            print(f"      Test 3: FP1 vs FP2: p={p_value_fp1_vs_fp2:.4f} "
+                  f"> {self.alpha2} → Use FP1")
+        return ('fp1', [best_fp1_power])
 
     # =========================================================================
     # Power Search Helpers
@@ -736,12 +923,20 @@ class MFPRegressor:
         """
         Find the pair of powers in :attr:`powers` that minimises RSS.
 
-        All ordered pairs ``(p1, p2)`` from :attr:`powers` are tested.
-        When ``p1 == p2``, the repeated-power FP2 form is used
-        (generating :math:`x^p` and :math:`x^p \\ln x`), stored as a
-        single-element list ``[p]``.  When ``p1 != p2``, two independent
-        transformations are generated, stored as ``[p1, p2]`` in sorted
-        order.
+        All *unordered* pairs ``(p1, p2)`` with ``p1 <= p2``, including
+        the repeated pairs ``p1 == p2``, are tested.  Because the two FP2
+        terms enter the design matrix additively, ``(p1, p2)`` and
+        ``(p2, p1)`` describe the same model, so enumerating combinations
+        with replacement rather than the full Cartesian product halves
+        the number of regressions without changing the result.
+
+        Powers are always returned as a **two-element list**.  When the
+        two entries are equal the repeated-power FP2 form is generated by
+        :meth:`_apply_fp_transform`, giving :math:`x^p` and
+        :math:`x^p \\ln x`.  Earlier versions stored the repeated case as
+        a single-element list ``[p]``, which
+        :meth:`_apply_fp_transform` could not distinguish from an FP1 and
+        which therefore silently produced a one-column FP1 fit.
 
         :param x: Single-variable vector to transform, shape
             ``(n_samples,)``.
@@ -753,27 +948,23 @@ class MFPRegressor:
         :type X_others: numpy.ndarray
 
         :returns: ``(best_powers, best_rss)`` where ``best_powers`` is a
-            one- or two-element list.
+            two-element list in ascending order.
         :rtype: tuple[list, float]
         """
         best_powers = None
         best_rss = np.inf
 
-        # Test all pairs of powers
-        for p1 in self.powers:
-            for p2 in self.powers:
-                if p1 == p2:
-                    # Repeated power: store as [p1]
-                    powers = [p1]
-                else:
-                    # Different powers: store as [p1, p2] in sorted order
-                    powers = sorted([p1, p2])
+        # Unordered pairs with replacement: (p1, p2) and (p2, p1) are the
+        # same additive model, and p1 == p2 gives the repeated-power form.
+        for p1, p2 in itertools.combinations_with_replacement(
+                sorted(self.powers), 2):
+            powers = [p1, p2]
 
-                rss = self._calculate_fp_rss(x, y, X_others, powers)
+            rss = self._calculate_fp_rss(x, y, X_others, powers)
 
-                if rss < best_rss:
-                    best_rss = rss
-                    best_powers = powers
+            if rss < best_rss:
+                best_rss = rss
+                best_powers = powers
 
         return best_powers, best_rss
 
@@ -850,10 +1041,11 @@ class MFPRegressor:
         x_shifted = self._shift_to_positive(x)
 
         if len(powers) == 1:
+            # FP1 (or linear, which is FP1 with p = 1): a single column.
+            # Repeated-power FP2 is never represented this way; it is
+            # stored as [p, p] so that it reaches the two-column branch
+            # below.  See _normalise_transforms.
             power = powers[0]
-
-            # Check if this is a repeated FP2 (will have 2 columns)
-            # For now, treat single power as FP1
             term1 = self._apply_single_power(x_shifted, power)
             return term1.reshape(-1, 1)
 
@@ -956,6 +1148,131 @@ class MFPRegressor:
             return np.zeros((X.shape[0], 0))
 
         return np.hstack(feature_list)
+
+    # =========================================================================
+    # Degrees of Freedom, Normalisation and Validation
+    # =========================================================================
+
+    def _n_terms(self, transform_type):
+        """
+        Return the number of regression columns a transformation generates.
+
+        :param transform_type: One of ``'excluded'``, ``'linear'``,
+            ``'fp1'``, ``'fp2'``.
+        :type transform_type: str
+
+        :returns: 0, 1 or 2.
+        :rtype: int
+        """
+        return self.N_TERMS[transform_type]
+
+    def _df_cost(self, transform_type):
+        """
+        Return the degrees of freedom charged for a transformation.
+
+        Under ``df_accounting='terms'`` this equals the number of fitted
+        regression terms.  Under ``'royston'`` an extra degree of freedom
+        is charged for each power selected from :attr:`powers`, because
+        the power was chosen to minimise RSS and therefore consumes
+        information that a fixed, pre-specified power would not.
+
+        :param transform_type: One of ``'excluded'``, ``'linear'``,
+            ``'fp1'``, ``'fp2'``.
+        :type transform_type: str
+
+        :returns: Degrees of freedom charged.
+        :rtype: int
+        """
+        return self.DF_COST[self.df_accounting][transform_type]
+
+    def _model_df(self, transforms):
+        """
+        Total degrees of freedom of the predictors in a transform dict.
+
+        The intercept is **not** included; callers add it explicitly so
+        that the null model is handled uniformly.
+
+        :param transforms: ``{var_idx: (transform_type, powers)}``.
+        :type transforms: dict
+
+        :returns: Sum of :meth:`_df_cost` over all entries.
+        :rtype: int
+        """
+        return sum(self._df_cost(t_type) for t_type, _ in transforms.values())
+
+    @staticmethod
+    def _normalise_transforms(transforms):
+        """
+        Return a copy of ``transforms`` in canonical internal form.
+
+        Two normalisations are applied:
+
+        - An ``'fp2'`` entry whose power list has a single element is
+          expanded to ``[p, p]``.  This is the repeated-power form, and
+          representing it with two entries is what allows
+          :meth:`_apply_fp_transform` to distinguish it from an FP1.
+          The single-element form was produced by earlier versions of
+          this class, so structures persisted from previous runs remain
+          loadable.
+        - Power lists are converted to plain Python lists of floats so
+          that equality comparisons in :meth:`_check_convergence` behave
+          predictably when powers arrive as numpy scalars.
+
+        :param transforms: ``{var_idx: (transform_type, powers)}``.
+        :type transforms: dict
+
+        :returns: Normalised copy.
+        :rtype: dict
+        """
+        normalised = {}
+
+        for var_idx, (transform_type, powers) in transforms.items():
+            powers = [float(p) for p in powers]
+
+            if transform_type == 'fp2' and len(powers) == 1:
+                powers = [powers[0], powers[0]]
+
+            normalised[int(var_idx)] = (transform_type, powers)
+
+        return normalised
+
+    def _validate_against_max_degree(self, transforms):
+        """
+        Check that a transform structure lies inside the permitted family.
+
+        Applied to ``fixed_transforms`` so that a structure discovered
+        with FP2 enabled cannot be silently refitted by a regressor
+        declared as FP1-only.  Structure-preserving refitting should
+        bypass *discovery*, not the declared family: allowing it to do so
+        would mean two models reported as ``max_degree=1`` had different
+        functional forms.
+
+        :param transforms: ``{var_idx: (transform_type, powers)}``.
+        :type transforms: dict
+
+        :raises ValueError: If any entry exceeds :attr:`max_degree`.
+        """
+        allowed = {0: {'excluded', 'linear'},
+                   1: {'excluded', 'linear', 'fp1'},
+                   2: {'excluded', 'linear', 'fp1', 'fp2'}}[self.max_degree]
+
+        offenders = {
+            var_idx: t_type
+            for var_idx, (t_type, _) in transforms.items()
+            if t_type not in allowed
+        }
+
+        if offenders:
+            raise ValueError(
+                f"fixed_transforms contains transformations outside the "
+                f"family permitted by max_degree={self.max_degree}: "
+                f"{offenders}. Either raise max_degree or supply a "
+                f"structure of matching degree."
+            )
+
+    # =========================================================================
+    # Statistical Testing
+    # =========================================================================
 
     def _likelihood_ratio_test(self, rss0, rss1, df0, df1, n):
         """
@@ -1130,11 +1447,18 @@ class MFPRegressor:
         """
         n_samples = X.shape[0]
 
+        # Defensive: this method may be called directly, so normalise and
+        # re-check rather than relying on the constructor having done so.
+        fixed_transforms = self._normalise_transforms(fixed_transforms)
+        self._validate_against_max_degree(fixed_transforms)
+
         if self.verbose:
             print("=" * 80)
             print("MFP WITH FIXED TRANSFORMATIONS")
             print("=" * 80)
             print(f"Samples: {n_samples}")
+            print(f"Permitted family: {self._family_description()} "
+                  f"(max_degree={self.max_degree})")
             print(f"Using pre-specified transformations (no discovery)")
             print("=" * 80)
 
@@ -1190,8 +1514,8 @@ class MFPRegressor:
                 power_str = self._format_power(power).replace('x', var_name)
                 transformations[var_name] = power_str
             elif transform_type == 'fp2':
-                if len(powers) == 1:
-                    # Repeated
+                if powers[0] == powers[1]:
+                    # Repeated power: x^p and x^p·ln(x)
                     power = powers[0]
                     power_str1 = self._format_power(power).replace('x', var_name)
                     if power == 0:
@@ -1227,6 +1551,8 @@ class MFPRegressor:
         lines.append("MULTIVARIABLE FRACTIONAL POLYNOMIALS - MODEL SUMMARY")
         lines.append("=" * 80)
         lines.append(f"\nConverged after {self.n_cycles_} cycles")
+        lines.append(f"Permitted family: {self._family_description()} "
+                     f"(max_degree={self.max_degree})")
         lines.append(f"Intercept: {self.intercept_:.4f}")
 
         lines.append("\nSelected Transformations:")
@@ -1249,7 +1575,7 @@ class MFPRegressor:
                 transform_str = transformations[var_name]
 
                 # Get coefficients for this variable
-                n_terms = 1 if transform_type in ['linear', 'fp1'] else 2
+                n_terms = self._n_terms(transform_type)
 
                 if coef_idx < len(self.coef_):
                     if n_terms == 1:
@@ -1266,6 +1592,19 @@ class MFPRegressor:
         lines.append("\n" + "=" * 80)
 
         return "\n".join(lines)
+
+    def _family_description(self):
+        """
+        Return a readable description of the permitted function family.
+
+        :returns: e.g. ``'excluded / linear / FP1'``.
+        :rtype: str
+        """
+        return {
+            0: 'excluded / linear',
+            1: 'excluded / linear / FP1',
+            2: 'excluded / linear / FP1 / FP2',
+        }[self.max_degree]
 
     def _format_power(self, power):
         """

@@ -14,7 +14,7 @@ Key Improvement:
 
 import pandas as pd
 import numpy as np
-from typing import Dict, Tuple, Optional, List
+from typing import Dict, Tuple, Optional, List, Any
 import warnings
 
 from knowledge_layer.parametric_regression.parametric_model_factory import ModelFactory
@@ -23,12 +23,14 @@ from knowledge_layer.multi_dataset_analysers.parametric_analysis_foundation impo
 from knowledge_layer.multi_dataset_analysers.coefficient_comparison.coefficient_comparison_display import CoefficientComparisonDisplay
 from knowledge_layer.multi_dataset_analysers.coefficient_comparison.coefficient_plotter import CoefficientChangePlotter
 from knowledge_layer.Metrics.regression_metrics_class import RegressionMetrics
-from config import LoggerMixin
+from config.loggermixin.logger_config import LoggerMixin
+from knowledge_layer.fleet_data_class.temporal_eligibility import TemporalEligibility
+from knowledge_layer.multi_dataset_analysers.coefficient_comparison.coefficient_bootstrap_mixin import CoefficientBootstrapMixin
 
 warnings.filterwarnings('ignore')
 
 
-class CoefficientComparisonAnalyzer(LoggerMixin):
+class CoefficientComparisonAnalyzer(LoggerMixin, CoefficientBootstrapMixin):
     """
     Analyze coefficient changes using matched datasets with structure preservation.
 
@@ -58,7 +60,14 @@ class CoefficientComparisonAnalyzer(LoggerMixin):
                  alternative_data: pd.DataFrame,
                  normalize: bool = True,
                  normalization_method: str = 'zscore',
-                 verbose: bool = True):
+                 target_predictor_constraints: dict[str, list[str]] | None = None,
+                 verbose: bool = True,
+                 build_year_col:str|None = None,
+                 year_edges:list|None=None,
+                 build_eligibility:TemporalEligibility|None=None,
+                 n_matches_per_ship:int=10,
+                 caliper:float|None=None,
+                 matching_bins:dict[str,list]|None=None):
         """
         Initialize coefficient comparison analyzer.
 
@@ -87,7 +96,15 @@ class CoefficientComparisonAnalyzer(LoggerMixin):
             dependent_variables=parametric_selector.target_dimensions,
             model_recommendations=parametric_selector.model_recommendations,
             detailed_results=parametric_selector.detailed_results,  # ✅ Pass for descriptor lookup
-            verbose=verbose
+            verbose=verbose,
+            target_predictor_constraints=target_predictor_constraints,
+            defer_matched_sets=False,
+            build_year_col=build_year_col,
+            year_edges=year_edges,
+            n_matches_per_ship=n_matches_per_ship,
+            build_eligibility=build_eligibility,
+            caliper=caliper,
+            matching_bins=matching_bins
         )
 
         # Store selector reference
@@ -108,6 +125,11 @@ class CoefficientComparisonAnalyzer(LoggerMixin):
 
         # Storage for results
         self.normalization_params = {}  # Maps (predictors, target) → params
+        #: Normalisation method actually used, per (predictors, target) key.
+        #: The method now varies by model form, so denormalisation cannot assume
+        #: the analyser-level default.
+        self.normalization_methods: dict[tuple, str] = {}
+
         self.comparison_results = None
 
         # ✅ NEW: Store descriptors for each dataset
@@ -116,6 +138,8 @@ class CoefficientComparisonAnalyzer(LoggerMixin):
             'conventional_matched': {},   # (predictors, target) → descriptor
             'alternative': {}             # (predictors, target) → descriptor
         }
+
+        self.excluded_targets: list[dict[str, Any]] = []
 
         # ✅ Initialize display class
         self.display = CoefficientComparisonDisplay(self)
@@ -141,6 +165,44 @@ class CoefficientComparisonAnalyzer(LoggerMixin):
     def matched_datasets(self) -> Dict:
         """Matched datasets (for backward compatibility)."""
         return self.foundation.matched_data_sets
+
+    def _prepare_cohort(
+            self,
+            dataset: pd.DataFrame,
+            predictors: list[str],
+            target: str,
+            *,
+            fit_params: bool = False,
+            normalization_params: dict | None = None,
+            normalization_method: str | None = None,
+    ) -> tuple | None:
+        """
+        Prepare one cohort's design matrix and target vector.
+
+        Dispatches on :attr:`normalize` so callers see a stable return arity:
+        ``(X, y, params)`` when ``fit_params`` is set, ``(X, y)`` otherwise.
+        ``params`` is ``None`` on the unnormalised path, which is what the
+        denormalisation and cross-evaluation steps expect.
+
+        :param fit_params: Return the fitted normalisation parameters as a
+            third element. Only the reference cohort should set this.
+        :returns: Prepared arrays, or ``None`` when the cohort is unusable.
+        """
+        if not self.normalize:
+            prep = self.foundation.prepare_dataset(dataset, predictors, target)
+            if prep is None:
+                return None
+            X, y = prep[0], prep[1]
+            return (X, y, None) if fit_params else (X, y)
+
+        return self.foundation.prepare_dataset_normalized(
+            dataset=dataset,
+            predictors=predictors,
+            target=target,
+            fit_params=fit_params,
+            normalization_params=normalization_params,
+            normalization_method=normalization_method,
+        )
 
     def _filter_results_by_performance(self,
                                        results_df: pd.DataFrame,
@@ -276,7 +338,8 @@ class CoefficientComparisonAnalyzer(LoggerMixin):
                             min_matched_samples: int = 10,
                             max_predictors: Optional[int] = None,  # ✅ NEW
                             require_alternative_data: bool = True,  # ✅ NEW
-                            display_results: bool = True) -> pd.DataFrame:
+                            display_results: bool = True,
+                            debug:bool=False) -> pd.DataFrame:
         """
         Analyze all targets with three-way comparison and structure preservation.
 
@@ -306,24 +369,7 @@ class CoefficientComparisonAnalyzer(LoggerMixin):
 
         Examples
         --------
-        >>> # Analyze all combinations (default)
-        >>> results = analyzer.analyze_all_targets()
 
-        >>> # Focus on single-predictor models only
-        >>> results = analyzer.analyze_all_targets(max_predictors=1)
-
-        >>> # Allow 2-predictor models, ensure alternative data exists
-        >>> results = analyzer.analyze_all_targets(
-        ...     max_predictors=2,
-        ...     require_alternative_data=True,
-        ...     min_alternative_samples=15
-        ... )
-
-        >>> # Skip alternative data check (risky - may analyze unavailable combos)
-        >>> results = analyzer.analyze_all_targets(
-        ...     max_predictors=2,
-        ...     require_alternative_data=False
-        ... )
         """
 
         if display_results and self.verbose:
@@ -337,6 +383,8 @@ class CoefficientComparisonAnalyzer(LoggerMixin):
 
         all_results = []
         skipped_targets = []
+        self.excluded_targets = []  # reset the manifest for this run
+        n_requested = len(self.foundation.target_dimensions)
 
         for target in self.foundation.target_dimensions:
             # ✅ UPDATED: Pass filtering parameters
@@ -350,6 +398,12 @@ class CoefficientComparisonAnalyzer(LoggerMixin):
             if best_combo is None:
                 if self.verbose:
                     print(f"\n  ⚠️  No valid combinations found for {target}")
+
+                self._record_exclusion(target, 'combination_selection',
+                                       'no_valid_combination',
+                                       max_predictors=max_predictors,
+                                       min_alternative_samples=min_alternative_samples)
+
                 skipped_targets.append(target)
                 continue
 
@@ -363,7 +417,8 @@ class CoefficientComparisonAnalyzer(LoggerMixin):
                 min_matched_samples=min_matched_samples,
                 display_results=display_results,
                 max_predictors=max_predictors,  # ✅ ADD
-                require_alternative_data=require_alternative_data  # ✅ ADD
+                require_alternative_data=require_alternative_data,
+                debug=debug
             )
 
             if result is not None:
@@ -388,6 +443,9 @@ class CoefficientComparisonAnalyzer(LoggerMixin):
             if skipped_targets:
                 print(f"\n⚠️  Skipped {len(skipped_targets)} targets due to filtering:")
                 print(f"  {', '.join(skipped_targets)}")
+
+        if self.excluded_targets:
+            self.print_exclusion_manifest(n_requested=n_requested)
 
         return results_df
 
@@ -459,6 +517,58 @@ class CoefficientComparisonAnalyzer(LoggerMixin):
     # SINGLE TARGET ANALYSIS WITH STRUCTURE PRESERVATION
     # ========================================================================
 
+    def _record_exclusion(
+            self,
+            target: str,
+            stage: str,
+            reason: str,
+            predictors: Optional[Tuple] = None,
+            model_type: Optional[str] = None,
+            **details,
+    ) -> None:
+        """
+        Record a target that was dropped before reaching the results DataFrame.
+
+        Targets can be silently discarded at seven points in
+        :meth:`_analyze_single_target_threeway` — a missing descriptor, four
+        insufficient-data gates, and three post-cleaning sample-count gates.
+        Each previously returned bare ``None``, so a dropped target left no
+        trace in the results and no trace in the figure caption either: the
+        caption counts only targets that produced a row, making an exclusion at
+        this stage indistinguishable from a target that was never requested.
+
+        This is the same *explicit exclusion manifest* pattern applied to the
+        R² quality filter — a target dropped for insufficient data is a
+        reportable finding about that cohort, not noise to be swallowed.
+
+        :param target: Target variable name.
+        :type target: str
+        :param stage: Pipeline stage at which the drop occurred, e.g.
+            ``'combination_selection'``, ``'descriptor_lookup'``,
+            ``'data_preparation'``, ``'data_cleaning'``.
+        :type stage: str
+        :param reason: Short machine-readable reason code, e.g.
+            ``'insufficient_clean_samples'``.
+        :type reason: str
+        :param predictors: Predictor combination, when one was selected.
+        :type predictors: tuple, optional
+        :param model_type: Selected model type, when known.
+        :type model_type: str, optional
+        :param details: Additional diagnostic fields merged into the record
+            (sample counts, thresholds, cohort name, and so on).
+
+        :returns: ``None``. Appends to :attr:`excluded_targets`.
+        """
+        record = {
+            'target': target,
+            'predictors': predictors,
+            'model_type': model_type,
+            'stage': stage,
+            'reason': reason,
+        }
+        record.update(details)
+        self.excluded_targets.append(record)
+
     def _analyze_single_target_threeway(
             self,
             target: str,
@@ -467,7 +577,8 @@ class CoefficientComparisonAnalyzer(LoggerMixin):
             display_results: bool,
             max_predictors=None,
             require_alternative_data: bool = True,
-    ) -> Optional[Dict]:
+            debug=False
+    ) -> dict|None:
         """
         Analyze a single target with structure-preserving three-way decomposition.
 
@@ -527,50 +638,83 @@ class CoefficientComparisonAnalyzer(LoggerMixin):
 
         key = (tuple(best_combo), target)
 
+        # ── Normalisation follows the model's functional form ─────────────────
+        # Resolved once here so all three cohorts, the denormalisation step and
+        # the cross-evaluations stay consistent. Multiplicative forms (MFP,
+        # power, log-domain) cannot be centred: see
+        # ParametricAnalysisFoundation.resolve_normalization_method.
+        base_method = self.normalization_method if self.normalize else 'zscore'
+
+        if self.normalize:
+            norm_method = self.foundation.resolve_normalization_method(
+                best_model_type, default=base_method,
+            )
+        else:
+            norm_method = None
+
+        if debug and self.normalize and norm_method != base_method:
+            print(f"\n🔍 DEBUG: normalisation for {target} [{best_model_type}]: "
+                  f"'{base_method}' → '{norm_method}' "
+                  f"(multiplicative form — centring not applied)")
+
         # ── Step 1: base descriptor ───────────────────────────────────────────
         base_descriptor = self._get_base_descriptor(key, best_model_type)
 
         if base_descriptor is None:
             if self.verbose:
                 print(f"  ⚠️  No descriptor available for {best_combo} → {target}")
+
+            self._record_exclusion(target, 'descriptor_lookup', 'no_descriptor',
+                                   predictors=tuple(best_combo),
+                                   model_type=best_model_type)
+
             return None
 
         # ── Step 2: normalised datasets ───────────────────────────────────────
-        conv_full_prep = self.foundation.prepare_dataset_normalized(
-            dataset=self.foundation.conventional_full,
-            predictors=list(best_combo),
-            target=target,
-            fit_params=True,
-            normalization_method=self.normalization_method if self.normalize else 'zscore',
-        )
+        conv_full_prep = self._prepare_cohort(
+    self.foundation.conventional_full, list(best_combo), target,
+    fit_params=True, normalization_method=norm_method,
+)
 
         if conv_full_prep is None:
             if self.verbose:
                 print(f"  ⚠️  Insufficient full conventional data for {target}")
+
+            self._record_exclusion(target, 'data_preparation', 'conventional_prep_failed',
+                                   predictors=tuple(best_combo),
+                                   model_type=best_model_type)
+
             return None
 
-        if self.normalize:
-            X_conv_full_norm, y_conv_full_norm, norm_params = conv_full_prep
-        else:
-            X_conv_full_norm, y_conv_full_norm = conv_full_prep
-            norm_params = None
+        X_conv_full_norm, y_conv_full_norm, norm_params = conv_full_prep
 
         matched_dataset = self.foundation.get_matched_dataset(best_combo)
 
         if matched_dataset is None or len(matched_dataset) < min_matched_samples:
             if self.verbose:
                 print(f"  ⚠️  Insufficient matched data")
+
+            self._record_exclusion(target, 'data_preparation', 'insufficient_matched_samples',
+                                   predictors=tuple(best_combo),
+                                   model_type=best_model_type,
+                                   n_available=len(matched_dataset) if matched_dataset is not None else 0,
+                                   n_required=min_matched_samples)
+
             return None
 
-        conv_matched_prep = self.foundation.prepare_dataset_normalized(
-            dataset=matched_dataset,
-            predictors=list(best_combo),
-            target=target,
-            normalization_params=norm_params,
-            normalization_method=self.normalization_method if self.normalize else 'zscore',
-        )
+        conv_matched_prep = self._prepare_cohort(
+    matched_dataset, list(best_combo), target,
+    normalization_params=norm_params, normalization_method=norm_method,
+)
 
         if conv_matched_prep is None:
+
+            self._record_exclusion(target, 'data_preparation', 'matched_prep_failed',
+                                   predictors=tuple(best_combo),
+                                   model_type=best_model_type,
+                                   n_available=len(self.foundation.alternative),
+                                   n_required=min_alternative_samples)
+
             return None
 
         X_conv_matched_norm, y_conv_matched_norm = conv_matched_prep
@@ -578,49 +722,80 @@ class CoefficientComparisonAnalyzer(LoggerMixin):
         if len(self.foundation.alternative) < min_alternative_samples:
             if self.verbose:
                 print(f"  ⚠️  Insufficient alternative data")
+
+            self._record_exclusion(target, 'data_preparation', 'insufficient_alternative_samples',
+                                   predictors=tuple(best_combo),
+                                   model_type=best_model_type,
+                                   n_available=len(self.foundation.alternative),
+                                   n_required=min_alternative_samples)
+
             return None
 
-        alt_prep = self.foundation.prepare_dataset_normalized(
-            dataset=self.foundation.alternative,
-            predictors=list(best_combo),
-            target=target,
-            normalization_params=norm_params,
-            normalization_method=self.normalization_method if self.normalize else 'zscore',
-        )
+        alt_prep = self._prepare_cohort(self.foundation.alternative,
+     list(best_combo), target,
+    normalization_params=norm_params, normalization_method=norm_method,
+)
 
         if alt_prep is None:
+            self._record_exclusion(target, 'data_preparation', 'alternative_prep_failed',
+                                   predictors=tuple(best_combo),
+                                   model_type=best_model_type,
+                                   n_available=len(self.foundation.alternative),
+                                   n_required=min_alternative_samples)
+
             return None
 
         X_alt_norm, y_alt_norm = alt_prep
         self.normalization_params[key] = norm_params
 
         # ── Step 3: clean data for nonlinear models ───────────────────────────
-        X_conv_full_clean, y_conv_full_clean, mask_conv_full = (
-            self._clean_data_for_nonlinear(
-                X_conv_full_norm, y_conv_full_norm,
-                best_model_type, "Full conventional",
-            )
-        )
-        if X_conv_full_clean is None:
-            return None
+        cohorts = [
+            ("Full conventional", X_conv_full_norm, y_conv_full_norm),
+            ("Matched conventional", X_conv_matched_norm, y_conv_matched_norm),
+            ("Alternative", X_alt_norm, y_alt_norm),
+        ]
+        cleaned = {}
 
-        X_conv_matched_clean, y_conv_matched_clean, mask_conv_matched = (
-            self._clean_data_for_nonlinear(
-                X_conv_matched_norm, y_conv_matched_norm,
-                best_model_type, "Matched conventional",
+        for cohort_name, X_raw, y_raw in cohorts:
+            X_c, y_c, mask_c, report = self._clean_data_for_nonlinear(
+                X_raw, y_raw, best_model_type, cohort_name,
+                target=target, debug=debug,
             )
-        )
-        if X_conv_matched_clean is None:
-            return None
 
-        X_alt_clean, y_alt_clean, mask_alt = (
-            self._clean_data_for_nonlinear(
-                X_alt_norm, y_alt_norm,
-                best_model_type, "Alternative",
-            )
+            if X_c is None:
+                self._record_exclusion(
+                    target=target,
+                    stage='data_cleaning',
+                    reason='insufficient_clean_samples',
+                    predictors=tuple(best_combo),
+                    model_type=best_model_type,
+                    cohort=cohort_name,
+                    n_available=report['n_original'],
+                    n_clean=report['n_clean'],
+                    removal_breakdown=report['removal_breakdown'],
+                    positivity_required=report['positivity_required'],
+                    column_minima=report['column_minima'],
+                )
+                return None
+
+            cleaned[cohort_name] = (X_c, y_c, mask_c)
+
+        X_conv_full_clean, y_conv_full_clean, mask_conv_full = cleaned["Full conventional"]
+        X_conv_matched_clean, y_conv_matched_clean, mask_conv_matched = cleaned["Matched conventional"]
+        X_alt_clean, y_alt_clean, mask_alt = cleaned["Alternative"]
+
+        self._cache_fit_inputs(
+            key=key,
+            target=target,
+            predictors=best_combo,
+            model_type=best_model_type,
+            base_descriptor=base_descriptor,
+            arrays={
+                'conventional_full': (X_conv_full_clean, y_conv_full_clean),
+                'conventional_matched': (X_conv_matched_clean, y_conv_matched_clean),
+                'alternative': (X_alt_clean, y_alt_clean),
+            },
         )
-        if X_alt_clean is None:
-            return None
 
         # ── Step 4: structure-preserving refit ───────────────────────────────
         if self.verbose:
@@ -700,7 +875,7 @@ class CoefficientComparisonAnalyzer(LoggerMixin):
 
             def _denorm(y_pred_norm):
                 return self.foundation.denormalize_predictions(
-                    y_pred_norm, norm_params, self.normalization_method,
+                    y_pred_norm, norm_params,norm_method,
                 )
 
             y_pred_conv_full = _denorm(y_pred_conv_full_norm)
@@ -735,6 +910,7 @@ class CoefficientComparisonAnalyzer(LoggerMixin):
                        'alt': (None, y_alt)},
             model_type=best_model_type,
             norm_params=norm_params,
+            norm_method=norm_method
         )
 
         # ── Step 9: coefficient decomposition ────────────────────────────────
@@ -759,7 +935,7 @@ class CoefficientComparisonAnalyzer(LoggerMixin):
             'n_predictors': len(best_combo),
             'model_type': best_model_type,
             'normalized': self.normalize,
-            'normalization_method': self.normalization_method if self.normalize else None,
+            'normalization_method': norm_method if self.normalize else None,
             'structure_preserved': True,
 
             'n_conventional_full': len(y_conv_full),
@@ -881,12 +1057,13 @@ class CoefficientComparisonAnalyzer(LoggerMixin):
 
     def _perform_cross_evaluations_with_descriptors(
             self,
-            descriptors: Dict,
-            data_norm: Dict,
-            data_orig: Dict,
+            descriptors: dict,
+            data_norm: dict,
+            data_orig: dict,
             model_type: str,
-            norm_params: Optional[Dict],
-    ) -> Dict:
+            norm_params: dict|None,
+            norm_method:str = 'zscore'
+    ) -> dict:
         """
         Cross-evaluate each fitted structure on the other datasets.
 
@@ -920,6 +1097,13 @@ class CoefficientComparisonAnalyzer(LoggerMixin):
             predictions to the original scale.
         :type norm_params: dict, optional
 
+        :param norm_method: Normalisation method used for this target, as
+            resolved by
+            :meth:`~ParametricAnalysisFoundation.resolve_normalization_method`.
+            Must match the method used to produce ``norm_params``, or
+            denormalised predictions will be on the wrong scale.
+        :type norm_method: str
+
         :returns: Dict with keys ``'full_on_matched'``,
             ``'full_on_alt'``, ``'matched_on_alt'``, each mapping to a
             metrics dict (or ``{}`` on failure).
@@ -944,7 +1128,7 @@ class CoefficientComparisonAnalyzer(LoggerMixin):
 
                 y_pred = (
                     self.foundation.denormalize_predictions(
-                        y_pred_norm, norm_params, self.normalization_method,
+                        y_pred_norm, norm_params, norm_method,
                     )
                     if self.normalize
                     else y_pred_norm
@@ -970,7 +1154,7 @@ class CoefficientComparisonAnalyzer(LoggerMixin):
                           y_pred: np.ndarray,
                           n_features: int) -> Dict:
         """Calculate regression metrics."""
-        metric_calculator = RegressionMetrics(y_pred, y_true)
+        metric_calculator = RegressionMetrics(y_pred=y_pred,y_true= y_true)
         metrics = metric_calculator.calculate_all_metrics(n_features)
         return metrics
 
@@ -1181,7 +1365,11 @@ class CoefficientComparisonAnalyzer(LoggerMixin):
                                  variable_name_map: Optional[Dict[str, str]] = None,  # For subplot titles
                                  formula_name_map: Optional[Dict[str, str]] = None,  # NEW: For formulas
                                  show_sign_change_legend: bool = False,
-                                 debug: bool = False):
+                                 title_bold_spacing: float = 0.030,
+                                 title_italic_spacing: float = 0.022,
+                                 title_gap_below: float = 0.015,
+                                 debug: bool = False,
+                                 ):
         """
         Plot coefficient changes for all targets in grid layout.
 
@@ -1243,6 +1431,9 @@ class CoefficientComparisonAnalyzer(LoggerMixin):
             variable_name_map=variable_name_map,
             formula_name_map=formula_name_map,  # NEW
             show_sign_change_legend=show_sign_change_legend,
+            title_bold_spacing=title_bold_spacing,
+            title_italic_spacing=title_italic_spacing,
+            title_gap_below=title_gap_below,
             debug=debug
         )
 
@@ -1463,35 +1654,54 @@ class CoefficientComparisonAnalyzer(LoggerMixin):
         y: np.ndarray,
         model_type: str,
         dataset_name: str,
-    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
+        target: Optional[str] = None,
+        min_samples: int = 10,
+        debug: bool = False,
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray],
+               Optional[np.ndarray], Dict[str, Any]]:
         """
         Remove invalid rows from ``(X, y)`` for nonlinear model types.
 
-        Nonlinear models fitted via :func:`scipy.optimize.curve_fit` fail when
-        the data contains NaN or Inf values.  Log-based models additionally
-        require all inputs and targets to be strictly positive (normalisation
-        can introduce negative values even when the original data was positive).
+        Nonlinear models fitted via :func:`scipy.optimize.curve_fit` fail on NaN
+        or Inf.  Log-based models additionally require strictly positive inputs
+        and targets.
 
-        For linear and polynomial model types this method is a no-op: it returns
-        the original arrays unchanged with an all-``True`` mask.
+        .. warning::
+
+           When :attr:`normalize` is enabled the arrays reaching this method are
+           z-scored, so roughly half of every cohort is negative **by
+           construction**.  For a log-based model the positivity filter then
+           removes every ship below the cohort mean.  A removal rate near 50–60%
+           on a large conventional fleet is the signature of this, not of dirty
+           data — the ``removal_breakdown`` and ``column_minima`` fields of the
+           returned report distinguish the two.
+
+        For linear and polynomial model types this is a no-op.
 
         :param X: Predictor matrix, shape ``(n_samples, n_features)``.
         :type X: numpy.ndarray
         :param y: Target vector, shape ``(n_samples,)``.
         :type y: numpy.ndarray
-        :param model_type: Model-type identifier used to decide whether
-            cleaning is required and which positivity constraints apply.
+        :param model_type: Model-type identifier, used to decide whether
+            cleaning applies and which positivity constraints hold.
         :type model_type: str
-        :param dataset_name: Human-readable label used in verbose output
-            (e.g. ``'Full conventional'``, ``'Alternative'``).
+        :param dataset_name: Cohort label used in messages, e.g.
+            ``'Full conventional'``, ``'Alternative'``.
         :type dataset_name: str
+        :param target: Target variable name, included in messages and the
+            report so a drop can be attributed to a specific target.
+        :type target: str, optional
+        :param min_samples: Minimum rows that must survive cleaning.
+        :type min_samples: int
+        :param debug: Print the per-reason removal breakdown and per-column
+            minima.  Independent of :attr:`verbose`.
+        :type debug: bool
 
-        :returns: A three-element tuple ``(X_clean, y_clean, mask)``.
-            Returns ``(None, None, None)`` when fewer than 10 valid samples
-            remain after cleaning, signalling that this target should be
-            skipped.
+        :returns: ``(X_clean, y_clean, mask, report)``.  The first three are
+            ``None`` when fewer than ``min_samples`` rows survive; ``report`` is
+            always populated.
         :rtype: tuple[numpy.ndarray | None, numpy.ndarray | None,
-            numpy.ndarray | None]
+            numpy.ndarray | None, dict]
         """
         nonlinear_models = {
             'power-log-multivariate', 'exponential-log-multivariate',
@@ -1500,33 +1710,162 @@ class CoefficientComparisonAnalyzer(LoggerMixin):
             'logarithmic', 'logarithmic-power',
         }
 
-        if model_type not in nonlinear_models:
-            return X, y, np.ones(len(X), dtype=bool)
-
         n_original = len(X)
+        label = f"{target} / {dataset_name}" if target else dataset_name
 
-        # Remove NaN / Inf
-        mask = ~(np.isnan(X).any(axis=1) | np.isnan(y))
-        mask &= ~(np.isinf(X).any(axis=1) | np.isinf(y))
+        report: Dict[str, Any] = {
+            'target': target,
+            'cohort': dataset_name,
+            'model_type': model_type,
+            'n_original': n_original,
+            'n_clean': n_original,
+            'n_removed': 0,
+            'cleaning_applied': False,
+            'positivity_required': False,
+            'removal_breakdown': {},
+            'column_minima': None,
+            'sufficient': True,
+        }
 
-        # Log-based models require strictly positive values
-        if 'log' in model_type or model_type in {'power', 'logarithmic', 'logarithmic-power'}:
-            mask &= (X > 0).all(axis=1) & (y > 0)
+        if model_type not in nonlinear_models:
+            return X, y, np.ones(n_original, dtype=bool), report
 
-        X_clean = X[mask]
-        y_clean = y[mask]
-        n_removed = n_original - len(X_clean)
+        report['cleaning_applied'] = True
 
-        if len(X_clean) < 10:
-            if self.verbose:
-                print(f"  ⚠️  {dataset_name}: Insufficient clean data "
-                      f"({len(X_clean)}/{n_original} samples remain)")
-            return None, None, None
+        # ── NaN / Inf ─────────────────────────────────────────────────────────
+        bad_nan = np.isnan(X).any(axis=1) | np.isnan(y)
+        bad_inf = np.isinf(X).any(axis=1) | np.isinf(y)
+        mask = ~(bad_nan | bad_inf)
 
-        if self.verbose and n_removed > 0:
-            pct = 100 * n_removed / n_original
-            print(f"  ℹ️  {dataset_name}: Cleaned data "
-                  f"({n_original} → {len(X_clean)} samples, "
-                  f"removed {n_removed} with NaN/Inf/negative [{pct:.1f}%])")
+        # ── Positivity, for log-domain forms ──────────────────────────────────
+        needs_positive = (
+            'log' in model_type
+            or model_type in {'power', 'logarithmic', 'logarithmic-power'}
+        )
+        bad_nonpositive = np.zeros(n_original, dtype=bool)
 
-        return X_clean, y_clean, mask
+        if needs_positive:
+            report['positivity_required'] = True
+            bad_nonpositive = ~((X > 0).all(axis=1) & (y > 0))
+            mask &= ~bad_nonpositive
+
+        X_clean, y_clean = X[mask], y[mask]
+        n_clean = len(X_clean)
+
+        # Counts overlap (a row can be both NaN and non-positive); reported
+        # separately so the dominant cause is visible.
+        report['removal_breakdown'] = {
+            'nan': int(bad_nan.sum()),
+            'inf': int(bad_inf.sum()),
+            'non_positive': int(bad_nonpositive.sum()),
+        }
+        with np.errstate(all='ignore'):
+            report['column_minima'] = np.nanmin(
+                np.column_stack([X, y.reshape(-1, 1)]), axis=0
+            ).round(4).tolist()
+
+        report['n_clean'] = n_clean
+        report['n_removed'] = n_original - n_clean
+        report['sufficient'] = n_clean >= min_samples
+
+        if debug:
+            print(f"\n🔍 DEBUG: _clean_data_for_nonlinear [{label}]")
+            print(f"   model type   : {model_type} "
+                  f"(positivity required: {needs_positive})")
+            print(f"   samples      : {n_original} → {n_clean} "
+                  f"({report['n_removed']} removed)")
+            print(f"   breakdown    : {report['removal_breakdown']} "
+                  f"(counts may overlap)")
+            print(f"   column minima: {report['column_minima']} "
+                  f"[predictors..., target]")
+            if needs_positive and report['removal_breakdown']['non_positive'] > 0:
+                print(f"   ⚠️  non-positive values dominate the removal. If the "
+                      f"minima above are near -2, the data is z-scored and this "
+                      f"filter is discarding the below-mean half of the cohort.")
+
+        if not report['sufficient']:
+            if self.verbose or debug:
+                print(f"  ⚠️  {label}: Insufficient clean data "
+                      f"({n_clean}/{n_original} samples remain, "
+                      f"minimum {min_samples}). Model type: {model_type}. "
+                      f"Removal breakdown: {report['removal_breakdown']}")
+            return None, None, None, report
+
+        if (self.verbose or debug) and report['n_removed'] > 0:
+            pct = 100 * report['n_removed'] / n_original
+            print(f"  ℹ️  {label}: Cleaned data "
+                  f"({n_original} → {n_clean} samples, "
+                  f"removed {report['n_removed']} with NaN/Inf/negative "
+                  f"[{pct:.1f}%])")
+
+        return X_clean, y_clean, mask, report
+
+    def print_exclusion_manifest(self, n_requested: int|None = None) -> None:
+        """
+        Print every target dropped before reaching the results DataFrame.
+
+        Reports counts against the number of targets *requested*, not the number
+        that produced results.  Without this distinction a caption reading
+        "Targets shown: 5/6" is ambiguous: it cannot express that a seventh
+        target was requested and dropped at an earlier stage.
+
+        :param n_requested: Number of targets originally requested.  When
+            supplied, an accounting line reconciles requested, analysed and
+            excluded counts.
+        :type n_requested: int, optional
+
+        :returns: ``None``.  Prints to stdout.
+        """
+        print("\n" + "=" * 80)
+        print("TARGET EXCLUSION MANIFEST")
+        print("=" * 80)
+
+        if n_requested is not None:
+            n_excluded = len(self.excluded_targets)
+            print(f"Requested: {n_requested} | "
+                  f"Analysed: {n_requested - n_excluded} | "
+                  f"Excluded: {n_excluded}")
+            print("-" * 80)
+
+        for record in self.excluded_targets:
+            print(f"\n  • {record['target']}"
+                  f"  [{record.get('model_type', 'unknown model')}]")
+            print(f"    stage  : {record['stage']}")
+            print(f"    reason : {record['reason']}")
+
+            if record.get('cohort'):
+                print(f"    cohort : {record['cohort']}")
+            if record.get('n_clean') is not None:
+                print(f"    samples: {record['n_clean']}/{record.get('n_available', '?')} "
+                      f"clean")
+            if record.get('removal_breakdown'):
+                print(f"    removed: {record['removal_breakdown']}")
+            if record.get('positivity_required') and record.get('column_minima'):
+                print(f"    minima : {record['column_minima']}  "
+                      f"← negative values here indicate normalised input to a "
+                      f"log-domain model")
+
+        print("\n" + "=" * 80)
+
+    @property
+    def functional_form(self) -> 'FunctionalFormPlotter':
+        """
+        Lazily-constructed plotter for fitted-function comparison.
+
+        Composed rather than built in :meth:`__init__` because it is only
+        meaningful once :meth:`analyze_all_targets` has populated
+        :attr:`model_descriptors`, and because most callers never need it.
+        The instance is cached, so the extractor it wraps — and any curves
+        a caller has hung off it — survive across calls.
+
+        :returns: Plotter bound to this analyser.
+        :rtype: FunctionalFormPlotter
+        """
+        from knowledge_layer.multi_dataset_analysers.coefficient_comparison.function_form_plotter import (
+            FunctionalFormPlotter,
+        )
+
+        if getattr(self, '_functional_form_plotter', None) is None:
+            self._functional_form_plotter = FunctionalFormPlotter(analyzer=self)
+
+        return self._functional_form_plotter

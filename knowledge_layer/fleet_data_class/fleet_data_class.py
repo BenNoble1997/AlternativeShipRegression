@@ -11,18 +11,15 @@ import os
 
 from typing import List, Dict, Any
 from pathlib import Path
-from dataclasses import dataclass, Field
 import pandas as pd
-import numpy as np
 
-from Operational_profile.data_processing.data_processing_enum_classes import ComparisonOperator
+from data_processing.data_processing_enum_classes import ComparisonOperator
 from knowledge_layer.fleet_data_class.matched_dataset_creation import MatchedDataset
 from knowledge_layer.fleet_data_class.Plotting_fleet_class import FleetPlottingClass
-from knowledge_layer.fleet_data_class.dataframe_analysis import DataframeAnalysis
 
-from config import LoggerMixin
-from Operational_profile.data_processing.workflow_class import DataProcessingWorkflow
-from Operational_profile.data_processing.file_import_class import DataImporter
+from config.loggermixin.logger_config import LoggerMixin
+from data_processing.workflow_class import DataProcessingWorkflow
+from data_processing.file_import_class import DataImporter
 
 
 
@@ -292,6 +289,15 @@ class FleetData(LoggerMixin):
                                                  require_all=require_all,
                                                  negate=negate)
 
+    def add_processed_data(
+            self,
+            df: pd.DataFrame,
+            name: str,
+    ) -> 'FleetData':
+        """Add an existing DataFrame directly to the processed data."""
+        self.processed_data[name] = df
+        self.logger.info(f"Added processed dataset '{name}'")
+        return self
 
     def processing_fleet_data(self,
                               datafile: str|pd.DataFrame|None=None,
@@ -309,6 +315,7 @@ class FleetData(LoggerMixin):
                               percentile_filter_cols:list[str]|None=None,
                               percentile:float|None=0.95,
                               max_nan_columns:list[str]|str|None=None,
+                              zero_as_missing:list[str]|None=None,
                               max_nan_no:int = 3
                               ):
         """
@@ -363,7 +370,8 @@ class FleetData(LoggerMixin):
                                                             percentile=percentile)
 
         if max_nan_columns is not None:
-            result = self.workflow.filter.maximum_nan_filter(data=result, columns=max_nan_columns,no_blanks=max_nan_no)
+            result = self.workflow.filter.maximum_nan_filter(data=result, columns=max_nan_columns,
+                                                             no_blanks=max_nan_no, zero_as_missing=zero_as_missing)
 
         if duplicates is not None:
             duplicate_columns = duplicates

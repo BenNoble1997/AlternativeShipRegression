@@ -19,6 +19,7 @@ from typing import Dict, List, Optional
 from pathlib import Path
 import matplotlib.pyplot as plt
 
+from knowledge_layer.fleet_data_class.temporal_eligibility import TemporalEligibility
 from knowledge_layer.literature_regressions.Literature_formula_evaluation_class import LiteratureFormulaEvaluator
 from knowledge_layer.literature_regressions.literature_formulas_class import LiteratureFormula
 from knowledge_layer.literature_regressions.source_dataset_management_class import SourceDatasetManager
@@ -47,19 +48,17 @@ class MultiDatasetLiteratureEvaluator:
     # 1. CLASS-LEVEL CONSTANTS  (replace the existing three constants)
     # ============================================================================
 
-    class MultiDatasetLiteratureEvaluator:
+    # Hard defaults — used when no thresholds are supplied at construction time.
+    _RRMSE_MAX_DEFAULT = 100.0
+    _R2_MIN_DEFAULT = 0.0
+    _R2_MAX_DEFAULT = 1.0
+    _MIN_ALT_SAMPLES_DEFAULT = 3
 
-        # Hard defaults — used when no thresholds are supplied at construction time.
-        _RRMSE_MAX_DEFAULT = 100.0
-        _R2_MIN_DEFAULT = 0.0
-        _R2_MAX_DEFAULT = 1.0
-
-        # Which result columns to check for each metric type.
-        # All six are checked against their respective bounds.
-        _METRIC_COLUMNS = {
-            'r2': ['conventional_r2', 'matched_r2', 'alternative_r2'],
-            'rrmse': ['conventional_rrmse', 'matched_rrmse', 'alternative_rrmse'],
-        }
+    # Which result columns to check for each metric type.
+    _METRIC_COLUMNS = {
+        'r2': ['conventional_r2', 'matched_r2', 'alternative_r2'],
+        'rrmse': ['conventional_rrmse', 'matched_rrmse', 'alternative_rrmse'],
+    }
 
     def __init__(self,
                  conventional_data: pd.DataFrame,
@@ -72,44 +71,63 @@ class MultiDatasetLiteratureEvaluator:
                  target_dimensions: List[str] = None,
                  predictor_dimensions: List[str] = None,
                  verbose: bool = True,
-                 # ── NEW: optional quality thresholds ──────────────────────
-                 r2_min:    float | None = None,
-                 r2_max:    float | None = None,
-                 rrmse_max: float | None = None):
+                 r2_min: float | None = 0,
+                 r2_max: float | None = 1,
+                 rrmse_max: float | None = 100,
+                 min_alternative_samples: int | None = 3,
+                 n_matches_per_ship:int=10,
+                 caliper:float|None=None,
+                 built_year_col: str = None,
+                 build_eligiblity:TemporalEligibility|None=None,
+                 matching_bins: dict[str,list] | None=None):
         """
         Initialize multi-dataset literature formula evaluator.
 
-        Parameters
-        ----------
-        conventional_data : pd.DataFrame
-            Full conventional ship dataset
-        alternative_datasets : dict[str, pd.DataFrame]
-            Dictionary mapping fuel type names to datasets
-            Example: {'LNG': lng_df, 'Methanol': methanol_df}
-        formulae : List[LiteratureFormula], optional
-            Explicit list of formulas to evaluate
-        formulae_file : str, optional
-            Path to Excel/CSV file with formulas
-        shiptype : ShipType, optional
-            Ship type for selecting Excel sheet
-        sheet_name : str, optional
-            Explicit sheet name (overrides shiptype)
-        reference : str
-            Default reference for formulas
-        target_dimensions : List[str], optional
-            Only evaluate formulas with these target dimensions
-        predictor_dimensions : List[str], optional
-            Only evaluate formulas using these predictor dimensions
-        verbose : bool
-            Print detailed progress
-        display : bool
-            Show initialization summary
+        :param conventional_data: Full conventional ship dataset.
+        :type conventional_data: pd.DataFrame
+        :param alternative_datasets: Mapping of fuel type name to dataset,
+            e.g. ``{'LNG': lng_df, 'Methanol': methanol_df}``.
+        :type alternative_datasets: dict[str, pd.DataFrame]
+        :param formulae: Explicit list of formulas to evaluate.
+        :type formulae: list[LiteratureFormula] or None
+        :param formulae_file: Path to Excel/CSV file with formulas.
+        :type formulae_file: str or None
+        :param shiptype: Ship type for selecting Excel sheet.
+        :type shiptype: ShipType or None
+        :param sheet_name: Explicit sheet name (overrides shiptype).
+        :type sheet_name: str or None
+        :param reference: Default reference for formulas.
+        :type reference: str
+        :param target_dimensions: Only evaluate formulas with these targets.
+        :type target_dimensions: list[str] or None
+        :param predictor_dimensions: Only evaluate formulas using these predictors.
+        :type predictor_dimensions: list[str] or None
+        :param verbose: Print detailed progress.
+        :type verbose: bool
+        :param r2_min: Lower R² quality bound for comparison filtering.
+        :type r2_min: float or None
+        :param r2_max: Upper R² quality bound for comparison filtering.
+        :type r2_max: float or None
+        :param rrmse_max: Upper RRMSE (%) quality bound for comparison filtering.
+        :type rrmse_max: float or None
+        :param min_alternative_samples: Minimum number of alternative fuel
+            ships required for a dataset to be evaluated. Datasets below this
+            threshold are skipped entirely — no evaluator (and hence no
+            expensive matched-dataset construction) is created for them.
+            Skipped datasets are recorded in ``self.skipped_datasets``.
+            Note the mechanical minimum is 3; statistically meaningful gap
+            analysis typically requires considerably more.
+        :type min_alternative_samples: int or None
         """
 
-        # Store instance-level thresholds, falling back to class defaults
-        self._r2_min = r2_min if r2_min is not None else 0.0
-        self._r2_max = r2_max if r2_max is not None else 1.0
-        self._rrmse_max = rrmse_max if rrmse_max is not None else 100.0
+        # Instance-level thresholds, falling back to class defaults
+        self._r2_min = r2_min if r2_min is not None else self._R2_MIN_DEFAULT
+        self._r2_max = r2_max if r2_max is not None else self._R2_MAX_DEFAULT
+        self._rrmse_max = rrmse_max if rrmse_max is not None else self._RRMSE_MAX_DEFAULT
+        self.min_alternative_samples = (
+            min_alternative_samples if min_alternative_samples is not None
+            else self._MIN_ALT_SAMPLES_DEFAULT
+        )
 
         self.conventional_data = conventional_data
         self.alternative_datasets = alternative_datasets
@@ -120,19 +138,67 @@ class MultiDatasetLiteratureEvaluator:
         self.reference = reference
         self.target_dimensions = target_dimensions
         self.predictor_dimensions = predictor_dimensions
+        self.built_year_col=built_year_col
+        self.build_eligibility = build_eligiblity
+        self.n_matches_per_ship = n_matches_per_ship
+        self.caliper = caliper
+        self.matching_bins = matching_bins
+
         self.verbose = verbose
 
-        # Validate inputs
         self._validate_inputs()
 
-        # Storage for individual evaluators
+        # Storage for individual evaluators (only for datasets that pass the
+        # size gate — see evaluate_all_datasets)
         self.evaluators: Dict[str, LiteratureFormulaEvaluator] = {}
+
+        # Record of datasets skipped due to insufficient data:
+        # {fuel_type: reason_string}
+        self.skipped_datasets: Dict[str, str] = {}
 
         # Storage for aggregated results
         self.comparison_results: Optional[pd.DataFrame] = None
 
         if self.verbose:
             self._print_initialization_summary()
+
+    def _dataset_passes_size_gate(self, alt_data: pd.DataFrame, fuel_type: str) -> bool:
+        """
+        Cheap necessary-condition check performed *before* evaluator creation.
+
+        The raw row count of the alternative dataset is an upper bound on the
+        size of any source- or domain-filtered subset of it, since filtering
+        only removes rows. If the raw count is already below
+        ``min_alternative_samples``, no evaluator constructed from this
+        dataset could ever produce alternative-side metrics, so constructing
+        one (which triggers expensive nearest-neighbour matched-dataset
+        creation against the full conventional fleet) would be wasted work.
+
+        Note this is deliberately only a *necessary* condition: a dataset
+        passing this gate may still prove insufficient after source filtering
+        inside the evaluator, which is caught by
+        ``LiteratureFormulaEvaluator.has_sufficient_alternative_data``.
+
+        :param alt_data: Alternative fuel dataset for one fuel type.
+        :type alt_data: pd.DataFrame
+        :param fuel_type: Name of the fuel type (used for the skip record).
+        :type fuel_type: str
+        :returns: True if the dataset is large enough to attempt evaluation.
+        :rtype: bool
+        """
+        n_ships = len(alt_data.dropna(how='all'))
+
+        if n_ships < self.min_alternative_samples:
+            reason = (f"{n_ships} ships < minimum {self.min_alternative_samples} "
+                      f"required for evaluation")
+            self.skipped_datasets[fuel_type] = reason
+
+            if self.verbose:
+                print(f"  ⊘ Skipping '{fuel_type}': {reason}. "
+                      f"No evaluator created (matched-dataset construction avoided).")
+            return False
+
+        return True
 
 
     def _row_metrics_are_valid(self, row: pd.Series) -> bool:
@@ -229,33 +295,119 @@ class MultiDatasetLiteratureEvaluator:
 
         return variable_groupings
 
+    def _resolve_plot_fuel_type(self,
+                                fuel_type: Optional[str],
+                                debug: bool = False
+                                ) -> tuple[Optional[str], Optional['LiteratureFormulaEvaluator']]:
+        """
+        Resolve a requested fuel type to its evaluator for plotting purposes.
+
+        Distinguishes three cases, applying a different policy to each:
+
+        1. **Unknown fuel type** (never present in ``alternative_datasets``):
+           raises ``ValueError`` — this is a programmer error such as a typo,
+           and should fail loudly.
+        2. **Known but skipped fuel type** (present in the inputs, but recorded
+           in ``skipped_datasets`` or otherwise lacking an evaluator): returns
+           ``(fuel_type, None)`` with an explanatory message — this is a
+           data-dependent condition the caller cannot predict, so plots should
+           degrade gracefully rather than crash the pipeline.
+        3. **Evaluated fuel type**: returns ``(fuel_type, evaluator)``.
+
+        When ``fuel_type`` is None, the first *successfully evaluated* fuel
+        type is selected (not merely the first entry in
+        ``alternative_datasets``, which may have been skipped).
+
+        :param fuel_type: Requested fuel type name, or None to auto-select.
+        :type fuel_type: str or None
+        :param debug: Print resolution details.
+        :type debug: bool
+        :returns: Tuple of (resolved fuel type name or None, evaluator or None).
+            The evaluator is None whenever plotting should be skipped.
+        :rtype: tuple[str or None, LiteratureFormulaEvaluator or None]
+        :raises ValueError: If ``fuel_type`` is not a known fuel type name.
+        """
+        # Auto-select: first fuel type that actually has an evaluator
+        if fuel_type is None:
+            if not self.evaluators:
+                print("⚠️  No evaluated fuel types available to plot. "
+                      "Run evaluate_all_datasets() first, and check "
+                      "skipped_datasets for exclusions.")
+                return None, None
+            fuel_type = next(iter(self.evaluators))
+            if self.verbose or debug:
+                print(f"No fuel type specified, using first evaluated: {fuel_type}")
+
+        # Case 1: genuinely unknown name → programmer error, raise
+        if fuel_type not in self.alternative_datasets:
+            raise ValueError(
+                f"Fuel type '{fuel_type}' not found. "
+                f"Available: {list(self.alternative_datasets.keys())}"
+            )
+
+        # Case 2: known, but no evaluator → skipped or not yet evaluated
+        if fuel_type not in self.evaluators:
+            reason = self.skipped_datasets.get(
+                fuel_type,
+                "not evaluated — run evaluate_all_datasets() first"
+            )
+            print(f"⊘ Cannot plot '{fuel_type}': {reason}. Skipping plot.")
+            return fuel_type, None
+
+        # Case 3: evaluated and available
+        if debug:
+            print(f"  [_resolve_plot_fuel_type] Resolved '{fuel_type}' to evaluator "
+                  f"with {len(self.evaluators[fuel_type].formulae)} formulae")
+
+        return fuel_type, self.evaluators[fuel_type]
+
     def evaluate_all_datasets(self,
                               display_results: bool = True,
                               metrics: str | List[str] = 'all') -> Dict[str, pd.DataFrame]:
         """
-        Run formula evaluation on all alternative fuel datasets.
+        Run formula evaluation on all sufficiently large alternative fuel datasets.
 
-        Creates an evaluator for each dataset and runs evaluate_all_formulae().
+        Two-tier data sufficiency check:
 
-        Parameters
-        ----------
-        display_results : bool
-            Whether to display results for each dataset
-        metrics : str or list
-            Which metrics to display ('all', 'r2', 'rrmse', or list of metric names)
+        1. **Pre-construction gate** (this method): datasets whose raw row
+           count is below ``min_alternative_samples`` are skipped before an
+           evaluator is created, avoiding wasted matched-dataset construction.
+           Skipped datasets are recorded in ``self.skipped_datasets`` and
+           receive no entry in the returned results.
+        2. **Post-evaluation check** (inside each evaluator): datasets passing
+           the gate may still be insufficient after source filtering; such
+           evaluators return conventional/matched metrics only, and plotting
+           is skipped for them.
 
-        Returns
-        -------
-        dict[str, pd.DataFrame]
-            Results DataFrames for each fuel type
+        :param display_results: Whether to display results for each dataset.
+        :type display_results: bool
+        :param metrics: Which metrics to display ('all', 'r2', 'rrmse',
+            or a list of metric names).
+        :type metrics: str or list
+        :returns: Results DataFrames keyed by fuel type. Only fuel types that
+            passed the size gate appear; check ``self.skipped_datasets`` for
+            omissions.
+        :rtype: dict[str, pd.DataFrame]
         """
 
         if self.verbose:
             print(f"\n{'=' * 70}")
-            print(f"Evaluating Formulas on {len(self.alternative_datasets)} Alternative Fuel Datasets")
+            print(f"Evaluating Formulas on {len(self.alternative_datasets)} "
+                  f"Alternative Fuel Datasets")
             print(f"{'=' * 70}\n")
 
         all_results = {}
+        self.skipped_datasets = {}  # Reset on each run
+
+        variable_map = {
+            'DWT': 'DWT (t)',
+            'GT': 'GT (m³)',
+            'LOA (M)': 'LOA (m)',
+            'LBP (M)': 'LBP (m)',
+            'BEAM (M)': 'Beam (m)',
+            'DEPTH (M)': 'Depth (m)',
+            'DRAFT (M)': 'Draft (m)',
+        }
 
         for fuel_type, alt_data in self.alternative_datasets.items():
 
@@ -264,7 +416,12 @@ class MultiDatasetLiteratureEvaluator:
                 print(f"Analyzing: {fuel_type}")
                 print(f"{'─' * 70}")
 
-            # Create evaluator for this fuel type
+            # ── Tier 1: cheap size gate BEFORE evaluator construction ──────
+            if not self._dataset_passes_size_gate(alt_data, fuel_type):
+                continue
+
+            # Create evaluator for this fuel type (expensive: builds
+            # matched datasets via nearest-neighbour matching)
             evaluator = self._create_evaluator(alt_data, fuel_type)
 
             # Run evaluation
@@ -273,56 +430,70 @@ class MultiDatasetLiteratureEvaluator:
                 metrics=metrics
             )
 
+            # ── Tier 2: post-filtering sufficiency check ────────────────────
+            # (source/domain filtering inside the evaluator may have reduced
+            # the alternative dataset below the threshold even though the raw
+            # dataset passed the gate)
+            if not evaluator.sufficient_alternative_data:
+                self.skipped_datasets[fuel_type] = (
+                    "insufficient alternative ships after source/domain filtering"
+                )
+                if self.verbose:
+                    print(f"  ⊘ '{fuel_type}': insufficient alternative fuel ships "
+                          f"after filtering (minimum "
+                          f"{evaluator.min_alternative_samples} required). "
+                          f"Keeping conventional/matched metrics; skipping plots.")
+                all_results[fuel_type] = results_df
+                continue
+
             # Store evaluator and results
             self.evaluators[fuel_type] = evaluator
             all_results[fuel_type] = results_df
 
-            variable_map = {
-                'DWT': 'DWT (t)',
-                'GT': 'GT (m³)',
-                'LOA (M)': 'LOA (m)',
-                'LBP (M)': 'LBP (m)',
-                'BEAM (M)': 'Beam (m)',
-                'DEPTH (M)': 'Depth (m)',
-                'DRAFT (M)':'Draft (m)',
-            }
-
-            # Basic usage with values shown
             evaluator.plot_comparison(
                 show_values=True,
                 variable_name_map=variable_map,
                 alternative_name=fuel_type,
             )
 
-        # Create comparison DataFrame
+        # Create comparison DataFrame from whatever succeeded
         self._create_comparison_dataframe(all_results)
 
         if self.verbose:
+            n_evaluated = len(self.evaluators)
+            n_skipped = len(self.skipped_datasets)
             print(f"\n{'=' * 70}")
-            print(f"✓ All {len(self.alternative_datasets)} datasets analyzed")
+            print(f"✓ {n_evaluated}/{len(self.alternative_datasets)} datasets analyzed"
+                  + (f" ({n_skipped} skipped: "
+                     f"{', '.join(self.skipped_datasets)})" if n_skipped else ""))
             print(f"{'=' * 70}\n")
 
         return all_results
 
     def _create_evaluator(self,
-                         alternative_data: pd.DataFrame,
-                         fuel_type: str) -> LiteratureFormulaEvaluator:
+                          alternative_data: pd.DataFrame,
+                          fuel_type: str) -> LiteratureFormulaEvaluator:
         """
-        Create LiteratureFormulaEvaluator for a specific fuel type.
+        Create a :class:`LiteratureFormulaEvaluator` for a specific fuel type.
 
-        Uses SourceDatasetManager for efficient domain filtering.
+        The wrapper's ``min_alternative_samples`` is passed through so the
+        inner (post-filtering) sufficiency check uses the same threshold as
+        the outer (pre-construction) size gate.
+
+        :param alternative_data: Alternative fuel dataset for this fuel type.
+        :type alternative_data: pd.DataFrame
+        :param fuel_type: Name of the fuel type.
+        :type fuel_type: str
+        :returns: Configured evaluator (verbose/display suppressed).
+        :rtype: LiteratureFormulaEvaluator
         """
-
-        # Create dataset manager for this fuel type
-        # Note: We need to create matched datasets for this specific fuel type
         dataset_manager = SourceDatasetManager(
             conventional=self.conventional_data,
-            matched=self.conventional_data.copy(),  # Placeholder, will be replaced
+            matched=self.conventional_data.copy(),  # Placeholder, replaced internally
             alternative=alternative_data,
-            verbose=False  # Suppress individual manager verbosity
+            verbose=self.verbose
         )
 
-        # Create evaluator
         evaluator = LiteratureFormulaEvaluator(
             dataset_manager=dataset_manager,
             formulae=self.formulae,
@@ -332,11 +503,15 @@ class MultiDatasetLiteratureEvaluator:
             reference=self.reference,
             target_dimensions=self.target_dimensions,
             predictor_dimensions=self.predictor_dimensions,
-            verbose=False,  # Suppress individual evaluator verbosity
-            display=False  # Don't display initialization for each
+            min_alt_samples=self.min_alternative_samples,
+            build_year_col=self.built_year_col,
+            verbose=self.verbose,
+            display=False,
+            build_eligibility=self.build_eligibility,
+            n_matches_per_ship=self.n_matches_per_ship,
+            caliper=self.caliper,
+            matching_bins=self.matching_bins,
         )
-
-
 
         return evaluator
 
@@ -349,6 +524,10 @@ class MultiDatasetLiteratureEvaluator:
           - RRMSE must be ≤ rrmse_max (%)        on conventional, matched AND alternative
 
         All six checks must pass for a row to be retained.
+
+        The removal report lists formula_id, not formula_name: two formulae
+        from different sources share a name, so a name-only report cannot say
+        which of them was dropped.
         """
         comparison_data = []
 
@@ -368,27 +547,30 @@ class MultiDatasetLiteratureEvaluator:
 
         # ── Filter out degenerate rows ──────────────────────────────────────
         valid_mask = combined.apply(self._row_metrics_are_valid, axis=1)
-        n_removed  = (~valid_mask).sum()
+        n_removed = (~valid_mask).sum()
 
         if n_removed > 0 and self.verbose:
-            removed = combined.loc[~valid_mask, ['formula_name', 'fuel_type']].drop_duplicates()
+            report_cols = [c for c in ('formula_id', 'formula_name', 'reference', 'fuel_type')
+                           if c in combined.columns]
+            removed = combined.loc[~valid_mask, report_cols].drop_duplicates()
             print(
                 f"\n⚠️  Removed {n_removed} result row(s) outside quality thresholds "
                 f"(R² ∉ [{self._r2_min}, {self._r2_max}]  or  "
                 f"RRMSE > {self._rrmse_max}%):"
             )
             for _, r in removed.iterrows():
-                print(f"   • {r['formula_name']}  [{r['fuel_type']}]")
+                label = r.get('formula_id', r.get('formula_name'))
+                print(f"   • {label}  [{r['fuel_type']}]")
 
         self.comparison_results = combined[valid_mask].copy()
 
         # ── Reorder columns for readability ────────────────────────────────
         priority_cols = [
-            'fuel_type', 'formula_name', 'formula_type',
+            'fuel_type', 'formula_id', 'formula_name', 'formula_type',
             'predictors', 'target', 'reference',
         ]
         all_cols = self.comparison_results.columns.tolist()
-        ordered  = [c for c in priority_cols if c in all_cols]
+        ordered = [c for c in priority_cols if c in all_cols]
         ordered += [c for c in all_cols if c not in ordered]
         self.comparison_results = self.comparison_results[ordered]
 
@@ -719,28 +901,39 @@ class MultiDatasetLiteratureEvaluator:
         print(f"✓ Comparison exported to {filename}")
 
     def _create_formula_summary(self) -> pd.DataFrame:
-        """Create summary statistics for each formula across all fuel types."""
+        """
+        Create summary statistics for each formula across all fuel types.
 
+        Grouping is on formula_id so that two sources publishing the same
+        functional form produce two rows rather than one row averaging both.
+        formula_name and reference are carried through for readability.
+        """
         summary_data = []
 
-        for formula_name in self.comparison_results['formula_name'].unique():
+        key_col = ('formula_id' if 'formula_id' in self.comparison_results.columns
+                   else 'formula_name')
+
+        for key in self.comparison_results[key_col].unique():
             formula_data = self.comparison_results[
-                self.comparison_results['formula_name'] == formula_name
-            ]
+                self.comparison_results[key_col] == key
+                ]
 
             summary_data.append({
-                'formula_name': formula_name,
+                'formula_id': key,
+                'formula_name': formula_data['formula_name'].iloc[0],
+                'reference': (formula_data['reference'].iloc[0]
+                              if 'reference' in formula_data.columns else None),
                 'target': formula_data['target'].iloc[0],
                 'predictors': formula_data['predictors'].iloc[0],
-                '4:54 PM_fuel_types_tested': len(formula_data),
+                'n_fuel_types_tested': len(formula_data),
                 'mean_alternative_r2': formula_data['alternative_r2'].mean(),
                 'std_alternative_r2': formula_data['alternative_r2'].std(),
                 'mean_alternative_rrmse': formula_data['alternative_rrmse'].mean(),
                 'std_alternative_rrmse': formula_data['alternative_rrmse'].std(),
                 'mean_gap_fuel_type_r2': formula_data['gap_fuel_type'].mean(),
                 'mean_gap_fuel_type_rrmse': formula_data['gap_fuel_type_rrmse'].mean(),
-                'max_gap_fuel_type_rrmse': formula_data['gap_fuel_type_rrmse'].abs().max()
-                })
+                'max_gap_fuel_type_rrmse': formula_data['gap_fuel_type_rrmse'].abs().max(),
+            })
 
         return pd.DataFrame(summary_data)
 
@@ -818,17 +1011,21 @@ class MultiDatasetLiteratureEvaluator:
         Returns
         -------
         list[str]
-            Formula names that pass robustness criteria
+            Formula ids that pass robustness criteria. These are ids, not
+            display names, so a formula published by two sources is judged
+            once per source rather than on the pooled gaps of both.
         """
-
         if self.comparison_results is None or len(self.comparison_results) == 0:
             return []
 
+        key_col = ('formula_id' if 'formula_id' in self.comparison_results.columns
+                   else 'formula_name')
+
         robust = []
 
-        for formula_name in self.comparison_results['formula_name'].unique():
+        for key in self.comparison_results[key_col].unique():
             formula_data = self.comparison_results[
-                self.comparison_results['formula_name'] == formula_name
+                self.comparison_results[key_col] == key
                 ]
 
             # Check if ALL fuel types have acceptable gaps
@@ -836,7 +1033,7 @@ class MultiDatasetLiteratureEvaluator:
             max_gap_r2 = formula_data['gap_fuel_type'].abs().max()
 
             if max_gap_rrmse <= threshold_rrmse and max_gap_r2 <= threshold_r2:
-                robust.append(formula_name)
+                robust.append(key)
 
         return robust
 
@@ -1009,19 +1206,21 @@ class MultiDatasetLiteratureEvaluator:
         # 1. Validate Inputs
         # ====================================================================
 
-        available_fuels = self.comparison_results['fuel_type'].unique()
+        available_fuels = set(self.comparison_results['fuel_type'].unique())
 
-        if fuel_type_1 not in available_fuels:
-            raise ValueError(
-                f"Fuel type '{fuel_type_1}' not found. "
-                f"Available: {sorted(available_fuels)}"
-            )
-
-        if fuel_type_2 not in available_fuels:
-            raise ValueError(
-                f"Fuel type '{fuel_type_2}' not found. "
-                f"Available: {sorted(available_fuels)}"
-            )
+        for ft in (fuel_type_1, fuel_type_2):
+            if ft not in self.alternative_datasets:
+                # Unknown name → programmer error
+                raise ValueError(
+                    f"Fuel type '{ft}' not found. "
+                    f"Available: {list(self.alternative_datasets.keys())}"
+                )
+            if ft not in available_fuels:
+                # Known but skipped/filtered → graceful skip
+                reason = self.skipped_datasets.get(ft, "no valid results")
+                print(f"⊘ Cannot compare: '{ft}' has no comparison results ({reason}). "
+                      f"Skipping plot.")
+                return
 
         # ====================================================================
         # 2. Extract Data for Both Datasets
@@ -1248,6 +1447,57 @@ class MultiDatasetLiteratureEvaluator:
         }
         return display_names.get(metric, metric.replace('_', ' ').title())
 
+    def _exclude_formulae_by_variables(self,
+                                       results: pd.DataFrame,
+                                       exclude_variables: Optional[List[str] | str] = None,
+                                       scope: str = 'predictors',
+                                       debug: bool = False) -> pd.DataFrame:
+        """
+        Drop result rows for formulae that use any of the given variables.
+
+        :param results: Comparison results (one row per formula per fuel type).
+        :param exclude_variables: Variable name or list of names, e.g. ['Vs'].
+        :param scope: Where to look for the variables: 'predictors', 'targets' or 'both'.
+        :param debug: Print which formulae were removed.
+        :returns: Filtered copy of ``results``.
+        """
+        if not exclude_variables:
+            return results
+
+        if isinstance(exclude_variables, str):
+            exclude_variables = [exclude_variables]
+        excluded = set(exclude_variables)
+
+        if scope not in ('predictors', 'targets', 'both'):
+            raise ValueError(f"scope must be 'predictors', 'targets' or 'both', got '{scope}'")
+
+        def variables_used(row) -> set:
+            used = set()
+            if scope in ('predictors', 'both'):
+                used |= set(row['predictors'])
+            if scope in ('targets', 'both'):
+                used.add(row['target'])
+            return used
+
+        used_per_row = results.apply(variables_used, axis=1)
+        drop_mask = used_per_row.apply(lambda used: bool(used & excluded))
+
+        # Guard against typos such as 'VS' or 'Vs ' silently excluding nothing
+        all_used = set().union(*used_per_row) if len(used_per_row) else set()
+        unknown = excluded - all_used
+        if unknown:
+            print(f"⚠️  exclude_variables not found in any formula's {scope}: {sorted(unknown)}")
+
+        if (debug or self.verbose) and drop_mask.any():
+            key = 'formula_id' if 'formula_id' in results.columns else 'formula_name'
+            dropped = results.loc[drop_mask, key].drop_duplicates()
+            print(f"\nExcluding {len(dropped)} formula(e) using {sorted(excluded & all_used)} "
+                  f"({scope}):")
+            for name in dropped:
+                print(f"   • {name}")
+
+        return results.loc[~drop_mask].copy()
+
     def plot_cascade_comparison(self,
                                 targets: Optional[List[str]] = None,
                                 variable_name_map: Optional[Dict[str, str]] = None,
@@ -1277,6 +1527,8 @@ class MultiDatasetLiteratureEvaluator:
                                 bar_label_font_size: Optional[int] = None,
                                 # ── bars ────────────────────────────────────────
                                 bar_width_scale: float = 0.75,
+                                exclude_variables: Optional[List[str] | str] = None,
+                                exclude_scope: str = 'predictors',
                                 ):
         """
         Create cascade plots showing Conventional → Matched → Alternative progression.
@@ -1393,11 +1645,33 @@ class MultiDatasetLiteratureEvaluator:
             print("No results available. Run evaluate_all_datasets() first.")
             return
 
+        results = self._exclude_formulae_by_variables(
+            self.comparison_results,
+            exclude_variables=exclude_variables,
+            scope=exclude_scope,
+            debug=debug,
+        )
+        if results.empty:
+            print("No formulae left to plot after variable exclusion.")
+            return
+
         # ====================================================================
         # 1. Get Fuel Types from Alternative Datasets Dictionary
         # ====================================================================
+        #
+        # fuel_types = list(self.alternative_datasets.keys())
 
-        fuel_types = list(self.alternative_datasets.keys())
+        # Only fuel types that produced usable comparison results.
+        # Preserve insertion order of alternative_datasets for stable panel order.
+        available = set(results['fuel_type'].unique())
+        fuel_types = [ft for ft in self.alternative_datasets.keys() if ft in available]
+        n_fuel_types = len(fuel_types)
+
+        if n_fuel_types == 0:
+            print("No fuel types with valid comparison results to plot.")
+            return
+
+
         n_fuel_types = len(fuel_types)
 
         if debug:
@@ -1418,8 +1692,8 @@ class MultiDatasetLiteratureEvaluator:
         fuel_type_formulas = {}
 
         for fuel_type in fuel_types:
-            df_fuel = self.comparison_results[
-                self.comparison_results['fuel_type'] == fuel_type
+            df_fuel = results[
+                results['fuel_type'] == fuel_type
                 ].copy()
 
             if targets is not None:
@@ -1448,7 +1722,7 @@ class MultiDatasetLiteratureEvaluator:
         threshold_text = None
         if category_thresholds is None and threshold_metric is not None:
             category_thresholds = self.compute_literature_reference_metrice(
-                comparison_results=self.comparison_results,
+                comparison_results=results,
                 variable_groupings=variable_groupings,
                 metric_type=threshold_metric,
                 dataset='conventional'
@@ -1475,9 +1749,9 @@ class MultiDatasetLiteratureEvaluator:
             print(f"\nDEBUG [Section 3]: Preparing data for sorting")
 
         first_fuel = fuel_types[0]
-        df_first = self.comparison_results[
-            (self.comparison_results['fuel_type'] == first_fuel) &
-            (self.comparison_results['formula_name'].isin(common_formulas))
+        df_first = results[
+            (results['fuel_type'] == first_fuel) &
+            (results['formula_name'].isin(common_formulas))
             ].copy()
 
         if targets is not None:
@@ -1701,9 +1975,9 @@ class MultiDatasetLiteratureEvaluator:
                 print(f"\n  --- Fuel type {fuel_idx + 1}/{n_fuel_types}: {fuel_type} ---")
 
             # Get data for this fuel type
-            df_fuel = self.comparison_results[
-                (self.comparison_results['fuel_type'] == fuel_type) &
-                (self.comparison_results['formula_name'].isin(common_formulas))
+            df_fuel = results[
+                (results['fuel_type'] == fuel_type) &
+                (results['formula_name'].isin(common_formulas))
                 ].copy()
 
             if targets is not None:
@@ -2222,27 +2496,13 @@ class MultiDatasetLiteratureEvaluator:
         # 1. Validate and Get Evaluator
         # ====================================================================
 
-        if fuel_type is None:
-            fuel_type = list(self.alternative_datasets.keys())[0]
-            if self.verbose:
-                print(f"No fuel type specified, using first: {fuel_type}")
-
-        if fuel_type not in self.alternative_datasets:
-            raise ValueError(
-                f"Fuel type '{fuel_type}' not found. "
-                f"Available: {list(self.alternative_datasets.keys())}"
-            )
-
         if layout not in ['horizontal', 'vertical']:
             raise ValueError(f"layout must be 'horizontal' or 'vertical', got '{layout}'")
 
-        if fuel_type not in self.evaluators:
-            raise ValueError(
-                f"No evaluator found for '{fuel_type}'. "
-                f"Run evaluate_all_datasets() first."
-            )
+        fuel_type, evaluator = self._resolve_plot_fuel_type(fuel_type, debug=debug)
 
-        evaluator = self.evaluators[fuel_type]
+        if evaluator is None:
+            return  # Message already printed by the resolver
 
         # ====================================================================
         # 2. Find Matching Formulas

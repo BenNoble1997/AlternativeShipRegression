@@ -83,6 +83,239 @@ class ParametricFormulaRenderer:
     """
 
     # =========================================================================
+    # Notation constants
+    # =========================================================================
+
+    #: Translation table mapping ASCII digits to Unicode subscripts (U+2080–U+2089).
+    #: These render correctly in matplotlib titles and tick labels with no LaTeX backend.
+    _SUBSCRIPT_DIGITS = str.maketrans('0123456789', '₀₁₂₃₄₅₆₇₈₉')
+
+    #: Coefficient keys that never receive a β index of their own.
+    #: ``'1'`` is the PolynomialFeatures bias column, which duplicates the intercept.
+    BIAS_KEYS = frozenset({'intercept', '1'})
+
+    @classmethod
+    def beta_symbol(cls, index: int, notation: str = 'math') -> str:
+        """
+        Return the canonical symbol for the ``index``-th model coefficient.
+
+        Centralises β typography.  Previously each renderer built the symbol
+        inline, producing ``'β₀'`` for the intercept but ``'β1'``, ``'β2'`` for
+        every subsequent term — two typographies inside a single formula — and
+        emitting ``'beta_1'`` rather than ``'\\beta_{1}'`` under LaTeX notation.
+
+        :param index: Zero-based coefficient index.  Index 0 is conventionally
+            the intercept for additive models, or the leading multiplicative
+            constant for power / exponential forms.
+        :type index: int
+        :param notation: ``'math'`` (Unicode subscripts), ``'latex'``, or
+            ``'python'``.
+        :type notation: str
+
+        :returns: e.g. ``'β₁₀'``, ``'\\beta_{10}'``, ``'beta_10'``.
+        :rtype: str
+        """
+        if notation == 'latex':
+            return rf"\beta_{{{index}}}"
+        if notation == 'python':
+            return f"beta_{index}"
+        return 'β' + str(index).translate(cls._SUBSCRIPT_DIGITS)
+
+    @classmethod
+    def build_beta_index_map(
+            cls,
+            coefficients: Optional[Dict[str, float]],
+            intercept: Optional[float],
+    ) -> Dict[str, int]:
+        """
+        Return the canonical β index assigned to each stored coefficient.
+
+        **This is the single source of truth for coefficient numbering.**  Every
+        renderer here consumes it, :meth:`ModelDescriptor.get_beta_index_map`
+        delegates to it, and the coefficient-change plotter reads it through the
+        descriptor — so the β₂ in a printed formula labels the same quantity as
+        the bar annotated β₂ beneath it, by construction rather than by
+        coincidence.
+
+        Ordering convention:
+
+        1. ``'intercept'`` takes index 0 whenever ``intercept`` is not ``None``.
+        2. Remaining coefficients follow in dict insertion order, which mirrors
+           the order the fitting code wrote them.
+        3. :attr:`BIAS_KEYS` are excluded.
+
+        Models with no additive intercept (all ``power`` / ``exponential``
+        forms, which store their leading constant as coefficient ``'a'``)
+        therefore start numbering at β₀ on that constant, instead of the
+        previous behaviour of starting at β₁ with no β₀ present.
+
+        :param coefficients: ``{feature_name: value}`` dict, or ``None``.
+        :type coefficients: dict, optional
+        :param intercept: Fitted intercept, or ``None``.
+        :type intercept: float, optional
+
+        :returns: Mapping ``{coefficient_name: beta_index}``.
+        :rtype: dict[str, int]
+        """
+        ordering: List[str] = []
+
+        if intercept is not None:
+            ordering.append('intercept')
+
+        if coefficients:
+            ordering.extend(n for n in coefficients if n not in cls.BIAS_KEYS)
+
+        return {name: idx for idx, name in enumerate(ordering)}
+
+    @classmethod
+    def suppressed_coefficients(
+            cls,
+            coefficients: Optional[Dict[str, float]],
+            regularization_type: Optional[str] = None,
+            active_features: Optional[List[str]] = None,
+            only_active: bool = True,
+            zero_tolerance: float = 1e-10,
+    ) -> set:
+        """
+        Return the coefficient names that the renderers omit from a formula.
+
+        Companion to :meth:`build_beta_index_map`.  The two are deliberately
+        separate: the index map stays **complete** so that suppressing a term
+        leaves a gap (β₀, β₁, β₃) rather than renumbering the survivors, which
+        would silently relabel the cubic term as β₂.  Suppression is therefore a
+        second, independent decision — and this method is its single definition,
+        so the formula and the coefficient-change plot omit exactly the same
+        terms.
+
+        Only Lasso families suppress anything.  For those, a coefficient is
+        suppressed when it is absent from ``active_features`` (when that list is
+        available) or when its magnitude is within ``zero_tolerance`` of zero.
+
+        :param coefficients: ``{feature_name: value}`` dict, or ``None``.
+        :type coefficients: dict, optional
+        :param regularization_type: ``'lasso'``, ``'ridge'``, or ``None``.
+        :type regularization_type: str, optional
+        :param active_features: Names retained by the Lasso fit.
+        :type active_features: list[str], optional
+        :param only_active: When ``False``, nothing is suppressed.
+        :type only_active: bool
+        :param zero_tolerance: Magnitude at or below which a coefficient counts
+            as zeroed.
+        :type zero_tolerance: float
+
+        :returns: Set of suppressed coefficient names.  Never includes
+            ``'intercept'``, which Lasso does not penalise.
+        :rtype: set[str]
+        """
+        if not only_active or regularization_type != 'lasso' or not coefficients:
+            return set()
+
+        active = set(active_features) if active_features else None
+
+        return {
+            name for name, value in coefficients.items()
+            if name not in cls.BIAS_KEYS
+               and (
+                       (active is not None and name not in active)
+                       or abs(value) <= zero_tolerance
+               )
+        }
+
+    @classmethod
+    def resolve_log_exponents(
+            cls,
+            coefficients: Optional[Dict[str, float]],
+            independent_vars: List[str],
+    ) -> List[Tuple[str, Optional[str], Optional[float]]]:
+        """
+        Resolve the per-predictor exponents of a log-transform model.
+
+        Coefficient keys for these models have been written under two
+        conventions in this codebase: ``'b_{i}_{var}'`` by
+        :meth:`~ModelDescriptor.from_fitted_model`, and the bare variable name
+        by the pre-fix refit path.  A rigid lookup against one convention hit
+        the ``.get()`` default of ``0.0``, which rendered as a
+        plausible-but-fabricated exponent of ``0.000``.
+
+        This method tries every known convention and returns ``None`` — never a
+        fabricated zero — when a coefficient genuinely cannot be located,
+        following the *invalidate rather than silently substitute* principle.
+        The caller then falls back to a β symbol, which is visibly a symbol
+        rather than a value.
+
+        :param coefficients: ``{feature_name: value}`` dict, or ``None``.
+        :type coefficients: dict, optional
+        :param independent_vars: Predictor names, in model column order.
+        :type independent_vars: list[str]
+
+        :returns: One tuple per predictor:
+            ``(variable_name, resolved_key_or_None, value_or_None)``.
+        :rtype: list[tuple[str, str | None, float | None]]
+        """
+        coefs = coefficients or {}
+        positional = [(k, v) for k, v in coefs.items() if k not in cls.BIAS_KEYS]
+
+        resolved: List[Tuple[str, Optional[str], Optional[float]]] = []
+
+        for i, var in enumerate(independent_vars):
+            candidates = [f'b_{i}_{var}', f'b_{i}', f'b{i}', var]
+            key = next((c for c in candidates if c in coefs), None)
+
+            if key is not None:
+                resolved.append((var, key, float(coefs[key])))
+            elif len(positional) == len(independent_vars):
+                # Positional fallback, only when the arity matches exactly
+                k, v = positional[i]
+                resolved.append((var, k, float(v)))
+            else:
+                resolved.append((var, None, None))
+
+        return resolved
+
+    @classmethod
+    def _term_prefix(
+            cls,
+            value: Optional[float],
+            index: int,
+            include_coeffs: bool,
+            notation: str,
+            sci_threshold: float,
+            sci_max: float,
+            leading: bool = False,
+    ) -> str:
+        """
+        Return the signed coefficient string, or the β symbol, for one term.
+
+        Shared by all renderers so that the value-vs-symbol decision and the β
+        typography are made in exactly one place.
+
+        :param value: Coefficient value, or ``None`` if unresolved.
+        :type value: float, optional
+        :param index: Canonical β index for this term.
+        :type index: int
+        :param include_coeffs: Render the numeric value when available.
+        :type include_coeffs: bool
+        :param notation: ``'math'``, ``'latex'``, or ``'python'``.
+        :type notation: str
+        :param sci_threshold: Lower magnitude bound for regular notation.
+        :type sci_threshold: float
+        :param sci_max: Upper magnitude bound for regular notation.
+        :type sci_max: float
+        :param leading: When ``True`` the ``'+'`` prefix is suppressed — used
+            for the first term of an expression.
+        :type leading: bool
+
+        :returns: e.g. ``'+0.523'``, ``'-0.089'``, ``'+β₂'``, ``'β₀'``.
+        :rtype: str
+        """
+        if include_coeffs and value is not None:
+            text = cls.format_coefficient(value, notation, sci_threshold, sci_max)
+            return text.lstrip('+') if leading else text
+
+        symbol = cls.beta_symbol(index, notation)
+        return symbol if leading else f"+{symbol}"
+
+    # =========================================================================
     # Primary Entry Point
     # =========================================================================
 
@@ -231,11 +464,9 @@ class ParametricFormulaRenderer:
             return ' \\cdot ' if notation == 'latex' else ' * ' if notation == 'python' else '·'
 
         def _coef_str(val, idx):
-            if include_coeffs and val is not None:
-                return cls.format_coefficient(val, notation, sci_threshold, sci_max)
-            sym = 'beta' if notation == 'python' else 'β'
-            sep = '_' if notation == 'python' else ''
-            return f"+{sym}{sep}{idx}"
+            return cls._term_prefix(
+                val, idx, include_coeffs, notation, sci_threshold, sci_max,
+            )
 
         terms = []
         if include_coeffs and intercept is not None:
@@ -244,12 +475,12 @@ class ParametricFormulaRenderer:
                 .lstrip('+')
             )
         else:
-            terms.append('beta_0' if notation == 'python' else 'β₀')
+            terms.append(cls.beta_symbol(0, notation))
 
         if not transformations:
             return f"{dependent_var} = {terms[0]}"
 
-        coef_idx = 1
+        coef_idx = 1 if intercept is not None else 0
         for var_idx, var_name in enumerate(independent_vars):
             if var_idx not in transformations:
                 continue
@@ -309,26 +540,31 @@ class ParametricFormulaRenderer:
 
     @classmethod
     def _render_polynomial(
-        cls,
-        dependent_var: str,
-        independent_vars: List[str],
-        coefficients: Optional[Dict[str, float]],
-        intercept: Optional[float],
-        polynomial_degree: Optional[int],
-        regularization_type: Optional[str],
-        active_features: Optional[List[str]],
-        only_active: bool,
-        include_coeffs: bool,
-        notation: str,
-        sci_threshold: float,
-        sci_max: float,
+            cls,
+            dependent_var: str,
+            independent_vars: List[str],
+            coefficients: Optional[Dict[str, float]],
+            intercept: Optional[float],
+            polynomial_degree: Optional[int],
+            regularization_type: Optional[str],
+            active_features: Optional[List[str]],
+            only_active: bool,
+            include_coeffs: bool,
+            notation: str,
+            sci_threshold: float,
+            sci_max: float,
     ) -> str:
         """
         Render a polynomial (or polynomial-regularised) formula.
 
-        For Lasso, terms absent from ``active_features`` or with
-        effectively zero coefficient are suppressed when
-        ``only_active=True``.
+        For Lasso, terms absent from ``active_features`` or with effectively
+        zero coefficient are suppressed when ``only_active=True``.  Suppressed
+        terms leave gaps in the β sequence — the index identifies the
+        parameter, so the gap is informative.
+
+        β indices now come from :meth:`build_beta_index_map`, replacing the
+        local counter that renumbered terms after each suppression and so
+        disagreed with the coefficient-change bar labels.
 
         :param polynomial_degree: Polynomial degree.
         :type polynomial_degree: int, optional
@@ -342,19 +578,17 @@ class ParametricFormulaRenderer:
         if not coefficients:
             return f"{dependent_var} = polynomial(degree={polynomial_degree})"
 
+        beta_map = cls.build_beta_index_map(coefficients, intercept)
+
         terms = []
         if intercept is not None:
-            if include_coeffs:
-                terms.append(
-                    cls.format_coefficient(intercept, notation, sci_threshold, sci_max)
-                    .lstrip('+')
-                )
-            else:
-                terms.append('beta_0' if notation == 'python' else 'β₀')
+            terms.append(cls._term_prefix(
+                intercept, beta_map['intercept'],
+                include_coeffs, notation, sci_threshold, sci_max, leading=True,
+            ))
 
-        coef_idx = 1
         for feature_name, coef_val in coefficients.items():
-            if feature_name in ('intercept', '1'):
+            if feature_name in cls.BIAS_KEYS:
                 continue
 
             if only_active and regularization_type == 'lasso':
@@ -363,43 +597,46 @@ class ParametricFormulaRenderer:
                 if abs(coef_val) < 1e-10:
                     continue
 
-            if include_coeffs:
-                c_str = cls.format_coefficient(coef_val, notation, sci_threshold, sci_max)
-            else:
-                sym = 'beta' if notation == 'python' else 'β'
-                sep = '_' if notation == 'python' else ''
-                c_str = f"+{sym}{sep}{coef_idx}"
+            c_str = cls._term_prefix(
+                coef_val, beta_map.get(feature_name, len(beta_map)),
+                include_coeffs, notation, sci_threshold, sci_max,
+            )
 
             if notation == 'latex':
-                f_str = feature_name.replace('*', ' ')
-                terms.append(f"{c_str} \\cdot {f_str}")
+                terms.append(f"{c_str} \\cdot {feature_name.replace('*', ' ')}")
             elif notation == 'python':
                 terms.append(f"{c_str} * {feature_name}")
             else:
-                f_str = feature_name.replace('*', '·').replace(' ', '')
-                terms.append(f"{c_str}·{f_str}")
-
-            coef_idx += 1
+                terms.append(f"{c_str}·{feature_name.replace('*', '·').replace(' ', '')}")
 
         formula = f"{dependent_var} = {' '.join(terms)}"
         return formula.replace("+ -", "- ").replace("+-", "-")
 
     @classmethod
     def _render_linear(
-        cls,
-        dependent_var: str,
-        independent_vars: List[str],
-        coefficients: Optional[Dict[str, float]],
-        intercept: Optional[float],
-        regularization_type: Optional[str],
-        only_active: bool,
-        include_coeffs: bool,
-        notation: str,
-        sci_threshold: float,
-        sci_max: float,
+            cls,
+            dependent_var: str,
+            independent_vars: List[str],
+            coefficients: Optional[Dict[str, float]],
+            intercept: Optional[float],
+            regularization_type: Optional[str],
+            only_active: bool,
+            include_coeffs: bool,
+            notation: str,
+            sci_threshold: float,
+            sci_max: float,
     ) -> str:
         """
         Render a linear / Ridge / Lasso formula.
+
+        β indices come from :meth:`build_beta_index_map` rather than a local
+        counter.  The local counter started at 1 unconditionally, so a model
+        with no intercept opened at β₁ with no β₀ anywhere in the expression —
+        and disagreed by one with the bar labels in the coefficient-change plot.
+
+        Note that suppressed Lasso terms leave gaps in the β sequence (β₀, β₂,
+        β₅).  This is deliberate: the index identifies the parameter, so a gap
+        signals a zeroed coefficient rather than being renumbered away.
 
         :param regularization_type: ``'lasso'``, ``'ridge'``, or ``None``.
         :type regularization_type: str, optional
@@ -409,52 +646,46 @@ class ParametricFormulaRenderer:
         if not coefficients:
             return f"{dependent_var} = linear({', '.join(independent_vars)})"
 
+        beta_map = cls.build_beta_index_map(coefficients, intercept)
+        mul = ' \\cdot ' if notation == 'latex' else ' * ' if notation == 'python' else '·'
+
         terms = []
         if intercept is not None:
-            if include_coeffs:
-                terms.append(
-                    cls.format_coefficient(intercept, notation, sci_threshold, sci_max)
-                    .lstrip('+')
-                )
-            else:
-                terms.append('beta_0' if notation == 'python' else 'β₀')
+            terms.append(cls._term_prefix(
+                intercept, beta_map['intercept'],
+                include_coeffs, notation, sci_threshold, sci_max, leading=True,
+            ))
 
-        coef_idx = 1
         for var_name in independent_vars:
             coef_val = coefficients.get(var_name)
             if coef_val is None:
                 continue
-            if only_active and regularization_type == 'lasso':
-                if abs(coef_val) < 1e-10:
-                    continue
+            if only_active and regularization_type == 'lasso' and abs(coef_val) < 1e-10:
+                continue
 
-            if include_coeffs:
-                c_str = cls.format_coefficient(coef_val, notation, sci_threshold, sci_max)
-            else:
-                sym = 'beta' if notation == 'python' else 'β'
-                sep = '_' if notation == 'python' else ''
-                c_str = f"+{sym}{sep}{coef_idx}"
-
-            mul = ' * ' if notation == 'python' else '·'
+            c_str = cls._term_prefix(
+                coef_val, beta_map.get(var_name, len(beta_map)),
+                include_coeffs, notation, sci_threshold, sci_max,
+            )
             terms.append(f"{c_str}{mul}{var_name}")
-            coef_idx += 1
 
         formula = f"{dependent_var} = {' '.join(terms)}"
         return formula.replace("+ -", "- ").replace("+-", "-")
 
     @classmethod
     def _render_simple_nonlinear(
-        cls,
-        model_type: str,
-        dependent_var: str,
-        independent_vars: List[str],
-        coefficients: Optional[Dict[str, float]],
-        intercept: Optional[float],
-        metadata: Optional[Dict],
-        include_coeffs: bool,
-        notation: str,
-        sci_threshold: float,
-        sci_max: float,
+            cls,
+            model_type: str,
+            dependent_var: str,
+            independent_vars: List[str],
+            coefficients: Optional[Dict[str, float]],
+            intercept: Optional[float],
+            metadata: Optional[Dict],
+            include_coeffs: bool,
+            notation: str,
+            sci_threshold: float,
+            sci_max: float,
+            debug: bool = False,
     ) -> str:
         """
         Render a univariate nonlinear formula.
@@ -462,22 +693,70 @@ class ParametricFormulaRenderer:
         Coefficients are stored under keys ``'a'``, ``'b'``, ``'c'``.
         When absent, reconstruction is attempted from ``metadata['popt']``.
 
+        These families carry **no additive intercept**: the leading constant is
+        coefficient ``'a'``, so ``intercept`` is ``None`` by contract (see
+        :meth:`ModelDescriptor.from_fitted_model`).  β numbering therefore runs
+        ``a → β₀``, ``b → β₁``, ``c → β₂``, which is what
+        :meth:`build_beta_index_map` returns for an ``intercept=None``
+        descriptor — the printed formula and the plotted bar labels agree by
+        construction rather than by coincidence.
+
+        .. note::
+           The single predictor name is bound to ``var`` here.  Previously the
+           templates below referenced ``var`` without ever binding it, so every
+           call raised ``NameError`` and callers silently fell back to a generic
+           additive-linear string built from the raw parameter names — e.g.
+           ``BEAM (M) = β₀ + β₁·a + β₂·b + β₃·c`` instead of
+           ``BEAM (M) = β₀·DWT^β₁ + β₂``.
+
         :param model_type: Specific nonlinear model type.
         :type model_type: str
+        :param dependent_var: Target variable name.
+        :type dependent_var: str
+        :param independent_vars: Predictor names; must have length 1.
+        :type independent_vars: list[str]
+        :param coefficients: ``{'a': …, 'b': …, 'c': …}``, or ``None``.
+        :type coefficients: dict, optional
+        :param intercept: Unused for this family; present for signature
+            uniformity across renderers.
+        :type intercept: float, optional
         :param metadata: May contain ``'popt'`` array for coefficient
             reconstruction.
         :type metadata: dict, optional
+        :param include_coeffs: Render numeric values rather than β symbols.
+        :type include_coeffs: bool
+        :param notation: ``'math'``, ``'latex'``, or ``'python'``.
+        :type notation: str
+        :param sci_threshold: Lower magnitude bound for regular notation.
+        :type sci_threshold: float
+        :param sci_max: Upper magnitude bound for regular notation.
+        :type sci_max: float
+        :param debug: Emit stage-by-stage diagnostics to stdout.
+        :type debug: bool
+
+        :returns: Rendered formula, or a structural fallback of the form
+            ``'y ~ power-offset(DWT)'`` when the parameters cannot be resolved.
+        :rtype: str
         """
         fallback = (
             f"{dependent_var} ~ "
             f"{model_type}({', '.join(independent_vars)})"
         )
 
-        # Reconstruct coefficients from popt if absent
+        if debug:
+            print(f"[_render_simple_nonlinear] type={model_type} "
+                  f"vars={independent_vars} keys={list((coefficients or {}).keys())} "
+                  f"include_coeffs={include_coeffs} notation={notation}")
+
+        # ------------------------------------------------------------------
+        # Stage 1 — reconstruct coefficients from popt if absent
+        # ------------------------------------------------------------------
         coefficients = dict(coefficients or {})
         if not coefficients:
             popt = (metadata or {}).get('popt')
             if popt is None:
+                if debug:
+                    print("  ✗ no coefficients and no metadata['popt'] → fallback")
                 return fallback
             if model_type in [
                 'exponential', 'logarithmic', 'power', 'logarithmic-power',
@@ -488,57 +767,92 @@ class ParametricFormulaRenderer:
                     'a': float(popt[0]), 'b': float(popt[1]), 'c': float(popt[2]),
                 }
             else:
+                if debug:
+                    print(f"  ✗ popt arity {len(popt)} incompatible with "
+                          f"{model_type} → fallback")
                 return fallback
+            if debug:
+                print(f"  reconstructed from popt: {coefficients}")
 
+        # ------------------------------------------------------------------
+        # Stage 2 — arity guard and predictor binding
+        # ------------------------------------------------------------------
         if len(independent_vars) != 1:
+            if debug:
+                print(f"  ✗ expected 1 predictor, got {len(independent_vars)} "
+                      f"→ fallback")
             return fallback
 
         var = independent_vars[0]
-        vals = list(coefficients.values())
-        a = coefficients.get('a') or (vals[0] if len(vals) > 0 else None)
-        b = coefficients.get('b') or (vals[1] if len(vals) > 1 else None)
-        c = (
-            coefficients.get('c')
-            or coefficients.get('offset')
-            or (vals[2] if len(vals) > 2 else None)
-        )
 
-        # β-symbol mode
+        # ------------------------------------------------------------------
+        # Stage 3 — resolve a / b / c, positionally if the keys are unusual
+        # ------------------------------------------------------------------
+        vals = [v for k, v in coefficients.items() if k not in cls.BIAS_KEYS]
+
+        def _param(name: str, position: int):
+            if name in coefficients:
+                return coefficients[name]
+            return vals[position] if len(vals) > position else None
+
+        a = _param('a', 0)
+        b = _param('b', 1)
+        c = coefficients.get('c', coefficients.get('offset'))
+        if c is None and len(vals) > 2:
+            c = vals[2]
+
+        if a is None or b is None:
+            if debug:
+                print(f"  ✗ could not resolve a/b (a={a}, b={b}) → fallback")
+            return fallback
+
+        if debug:
+            print(f"  resolved: var={var!r} a={a} b={b} c={c}")
+
+        # ------------------------------------------------------------------
+        # Stage 4a — β-symbol mode
+        # ------------------------------------------------------------------
         if not include_coeffs:
             templates = {
                 'exponential': {
-                    'math':   f"{dependent_var} = β₀·exp(β₁·{var})",
-                    'latex':  f"{dependent_var} = \\beta_0 \\cdot \\exp(\\beta_1 \\cdot {var})",
+                    'math': f"{dependent_var} = β₀·exp(β₁·{var})",
+                    'latex': f"{dependent_var} = \\beta_0 \\cdot \\exp(\\beta_1 \\cdot {var})",
                     'python': f"{dependent_var} = beta_0 * exp(beta_1 * {var})",
                 },
                 'exponential-offset': {
-                    'math':   f"{dependent_var} = β₀·exp(β₁·{var}) + β₂",
-                    'latex':  f"{dependent_var} = \\beta_0 \\cdot \\exp(\\beta_1 \\cdot {var}) + \\beta_2",
+                    'math': f"{dependent_var} = β₀·exp(β₁·{var}) + β₂",
+                    'latex': f"{dependent_var} = \\beta_0 \\cdot \\exp(\\beta_1 \\cdot {var}) + \\beta_2",
                     'python': f"{dependent_var} = beta_0 * exp(beta_1 * {var}) + beta_2",
                 },
                 'power': {
-                    'math':   f"{dependent_var} = β₀·{var}^β₁",
-                    'latex':  f"{dependent_var} = \\beta_0 \\cdot {var}^{{\\beta_1}}",
+                    'math': f"{dependent_var} = β₀·{var}^β₁",
+                    'latex': f"{dependent_var} = \\beta_0 \\cdot {var}^{{\\beta_1}}",
                     'python': f"{dependent_var} = beta_0 * {var}**beta_1",
                 },
                 'power-offset': {
-                    'math':   f"{dependent_var} = β₀·{var}^β₁ + β₂",
-                    'latex':  f"{dependent_var} = \\beta_0 \\cdot {var}^{{\\beta_1}} + \\beta_2",
+                    'math': f"{dependent_var} = β₀·{var}^β₁ + β₂",
+                    'latex': f"{dependent_var} = \\beta_0 \\cdot {var}^{{\\beta_1}} + \\beta_2",
                     'python': f"{dependent_var} = beta_0 * {var}**beta_1 + beta_2",
                 },
                 'logarithmic': {
-                    'math':   f"{dependent_var} = β₀·ln({var}) + β₁",
-                    'latex':  f"{dependent_var} = \\beta_0 \\cdot \\ln({var}) + \\beta_1",
+                    'math': f"{dependent_var} = β₀·ln({var}) + β₁",
+                    'latex': f"{dependent_var} = \\beta_0 \\cdot \\ln({var}) + \\beta_1",
                     'python': f"{dependent_var} = beta_0 * log({var}) + beta_1",
                 },
                 'logarithmic-power': {
-                    'math':   f"{dependent_var} = β₀·(ln({var}))^β₁",
-                    'latex':  f"{dependent_var} = \\beta_0 \\cdot (\\ln({var}))^{{\\beta_1}}",
+                    'math': f"{dependent_var} = β₀·(ln({var}))^β₁",
+                    'latex': f"{dependent_var} = \\beta_0 \\cdot (\\ln({var}))^{{\\beta_1}}",
                     'python': f"{dependent_var} = beta_0 * (log({var}))**beta_1",
                 },
             }
-            return templates.get(model_type, {}).get(notation, fallback)
+            rendered = templates.get(model_type, {}).get(notation, fallback)
+            if debug:
+                print(f"  → β-symbol: {rendered}")
+            return rendered
 
+        # ------------------------------------------------------------------
+        # Stage 4b — numeric mode
+        # ------------------------------------------------------------------
         a_str = cls.format_coefficient(a, notation, sci_threshold, sci_max).lstrip('+')
         b_str = cls.format_coefficient(b, notation, sci_threshold, sci_max).lstrip('+')
         c_str = (
@@ -593,61 +907,116 @@ class ParametricFormulaRenderer:
         else:
             formula = fallback
 
-        return formula.replace("+ -", "- ").replace("+-", "-")
+        formula = formula.replace("+ -", "- ").replace("+-", "-")
+
+        if debug:
+            print(f"  → numeric: {formula}")
+
+        return formula
 
     @classmethod
     def _render_log_transform(
-        cls,
-        model_type: str,
-        dependent_var: str,
-        independent_vars: List[str],
-        coefficients: Optional[Dict[str, float]],
-        intercept: Optional[float],
-        include_coeffs: bool,
-        notation: str,
-        sci_threshold: float,
-        sci_max: float,
+            cls,
+            model_type: str,
+            dependent_var: str,
+            independent_vars: List[str],
+            coefficients: Optional[Dict[str, float]],
+            intercept: Optional[float],
+            include_coeffs: bool,
+            notation: str,
+            sci_threshold: float,
+            sci_max: float,
     ) -> str:
         """
         Render a log-linearised multivariate formula.
 
-        The intercept is stored back-transformed (``a = exp(log_intercept)``).
+        Functional forms:
+
+        - ``power-log-multivariate``:
+          :math:`y = a\\,x_1^{b_1} x_2^{b_2}`, fitted as
+          :math:`\\ln y = \\ln a + b_1 \\ln x_1 + b_2 \\ln x_2`
+        - ``exponential-log-multivariate``:
+          :math:`y = a\\,e^{b_1 x_1 + b_2 x_2}`, fitted as
+          :math:`\\ln y = \\ln a + b_1 x_1 + b_2 x_2`
+
+        ``intercept`` is expected to hold the **back-transformed** constant
+        :math:`a`, matching the storage contract established by
+        :meth:`~ModelDescriptor.from_fitted_model` and
+        :meth:`~ModelDescriptor._update_from_log_transform_model`.
+
+        Fixes applied
+        -------------
+        - ``include_coeffs`` is now honoured.  Previously it was accepted and
+          discarded, so these models always printed numbers while every other
+          family printed β symbols when asked for symbolic output.
+        - Operators are notation-appropriate.  ``'math'`` previously fell
+          through to the Python branch, producing ``0.189*DWT**0.000`` instead
+          of ``1.208·DWT^0.310``.
+        - Exponents resolve through :meth:`resolve_log_exponents`, which
+          tolerates both key conventions and never substitutes a fabricated
+          ``0.0``.  An unresolvable exponent renders as its β symbol.
+        - Values route through :meth:`format_coefficient`, so ``sci_threshold``
+          and ``sci_max`` now apply here as they do elsewhere.
+        - The no-coefficients branch respects ``notation``; it previously
+          emitted LaTeX unconditionally.
 
         :param model_type: ``'power-log-multivariate'`` or
             ``'exponential-log-multivariate'``.
         :type model_type: str
         """
-        if not coefficients:
-            if model_type == 'power-log-multivariate':
-                terms = [f"{v}^{{b_{i}}}" for i, v in enumerate(independent_vars)]
-                return f"{dependent_var} = a \\cdot " + " \\cdot ".join(terms)
-            else:
-                terms = [f"b_{i} \\cdot {v}" for i, v in enumerate(independent_vars)]
-                return (f"{dependent_var} = a \\cdot \\exp\\left("
-                        + " + ".join(terms) + "\\right)")
+        beta_map = cls.build_beta_index_map(coefficients, intercept)
+        exponents = cls.resolve_log_exponents(coefficients, independent_vars)
 
-        a = intercept
+        # Notation-dependent operators
+        if notation == 'latex':
+            mul, pow_open, pow_close = r" \cdot ", "^{", "}"
+            exp_open, exp_close = r"\exp\left(", r"\right)"
+        elif notation == 'python':
+            mul, pow_open, pow_close = " * ", "**", ""
+            exp_open, exp_close = "exp(", ")"
+        else:  # math
+            mul, pow_open, pow_close = "·", "^", ""
+            exp_open, exp_close = "exp(", ")"
+
+        # Leading multiplicative constant a
+        a_str = cls._term_prefix(
+            intercept, beta_map.get('intercept', 0),
+            include_coeffs, notation, sci_threshold, sci_max,
+            leading=True,
+        )
+
+        # β index offset: exponents follow the intercept when one is present
+        offset = 1 if 'intercept' in beta_map else 0
+
+        def _exponent(position: int, key: Optional[str],
+                      value: Optional[float]) -> str:
+            """Unsigned exponent string — numeric when resolved, else β."""
+            idx = beta_map.get(key, position + offset) if key else position + offset
+            return cls._term_prefix(
+                value, idx, include_coeffs, notation, sci_threshold, sci_max,
+                leading=True,
+            )
+
+        # ── Power form: y = a · x₁^b₁ · x₂^b₂ ─────────────────────────────
         if model_type == 'power-log-multivariate':
-            parts = [f"{a:.3f}"]
-            for i, var in enumerate(independent_vars):
-                b = coefficients.get(f'b_{i}_{var}', 0.0)
-                parts.append(
-                    f"{var}^{{{b:.3f}}}" if notation == 'latex'
-                    else f"{var}**{b:.3f}"
-                )
-            mul = r" \cdot " if notation == 'latex' else " * "
+            parts = [a_str]
+            for i, (var, key, value) in enumerate(exponents):
+                parts.append(f"{var}{pow_open}{_exponent(i, key, value)}{pow_close}")
             return f"{dependent_var} = " + mul.join(parts)
-        else:
-            exp_terms = []
-            for i, var in enumerate(independent_vars):
-                b = coefficients.get(f'b_{i}_{var}', 0.0)
-                sign = "+" if b >= 0 else "-"
-                exp_terms.append(f"{sign} {abs(b):.3f} \\cdot {var}")
-            content = " ".join(exp_terms).lstrip("+ ")
-            if notation == 'latex':
-                return (f"{dependent_var} = {a:.3f} "
-                        f"\\cdot \\exp\\left({content}\\right)")
-            return f"{dependent_var} = {a:.3f} * exp({content})"
+
+        # ── Exponential form: y = a · exp(b₁·x₁ + b₂·x₂) ──────────────────
+        exp_terms: List[str] = []
+        for i, (var, key, value) in enumerate(exponents):
+            idx = beta_map.get(key, i + offset) if key else i + offset
+            prefix = cls._term_prefix(
+                value, idx, include_coeffs, notation, sci_threshold, sci_max,
+            )
+            exp_terms.append(f"{prefix}{mul}{var}")
+
+        content = " ".join(exp_terms).lstrip('+').strip()
+
+        return (f"{dependent_var} = {a_str}{mul}"
+                f"{exp_open}{content}{exp_close}")
 
     # =========================================================================
     # Public Formatting Utilities

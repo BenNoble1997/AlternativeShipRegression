@@ -116,7 +116,7 @@ def random_forest_selector(shiptype: ShipType,
     variables, filepath, save_dir = get_variables(shiptype=shiptype)
 
     fleet = getting_alt_fuel_ships(filepath=filepath,
-                                   ship_type=shiptype)
+                                   shiptype=shiptype)
 
     conventional_df = fleet.processed_data['pure_conventional']
 
@@ -776,7 +776,7 @@ def main():
 
     variables, filepath, save_dir = get_variables(shiptype=shiptype)
 
-    fleet = getting_alt_fuel_ships(filepath=filepath, ship_type=shiptype)
+    fleet = getting_alt_fuel_ships(filepath=filepath, shiptype=shiptype)
     conventional_df = fleet.processed_data['pure_conventional']
 
     print(f"\nDataset loaded: {len(conventional_df)} ships")
@@ -839,7 +839,7 @@ def quick_test():
     shiptype = ShipType.BULK_CARRIER
     variables, filepath, save_dir = get_variables(shiptype=shiptype)
 
-    fleet = getting_alt_fuel_ships(filepath=filepath, ship_type=shiptype)
+    fleet = getting_alt_fuel_ships(filepath=filepath, shiptype=shiptype)
     conventional_df = fleet.processed_data['pure_conventional']
 
     selector = RandomForestSelector(

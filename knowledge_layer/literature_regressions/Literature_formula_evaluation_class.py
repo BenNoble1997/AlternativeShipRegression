@@ -6,7 +6,8 @@ from typing import List
 import pandas as pd
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 from knowledge_layer.fleet_data_class.matched_dataset_creation import MatchedDataset
-from config.logger_config import LoggerMixin
+from knowledge_layer.fleet_data_class.temporal_eligibility import TemporalEligibility
+from config.loggermixin.logger_config import LoggerMixin
 
 import matplotlib.pyplot as plt
 
@@ -57,7 +58,14 @@ class LiteratureFormulaEvaluator(LoggerMixin):
                  target_dimensions: List[str] = None,
                  predictor_dimensions: List[str] = None,
                  verbose: bool = True,
-                 display: bool = True):
+                 min_alt_samples:int=3,
+                 display: bool = True,
+                 build_year_col:str|None=None,
+                 year_edges: list[int] | None = None,
+                 build_eligibility:TemporalEligibility|None=None,
+                 n_matches_per_ship:int=10,
+                 caliper:float|None=None,
+                 matching_bins:dict[str,list]|None=None,):
         """
         Parameters
         ----------
@@ -93,12 +101,23 @@ class LiteratureFormulaEvaluator(LoggerMixin):
 
         self.verbose = verbose
 
-        if self.verbose:
-            self.logger.setLevel(logging.INFO)
+        self.set_log_level(verbose=self.verbose)
 
         self.target_dimensions = target_dimensions
         self.predictor_dimensions = predictor_dimensions
         self.shiptype = shiptype
+        self.min_alt_samples = 3
+
+        self.build_year_col = build_year_col
+        self.year_edges = year_edges
+        self.build_eligibility = build_eligibility
+        self.n_matches_per_ship = n_matches_per_ship
+        self.caliper = caliper
+        self.matched_bins = matching_bins
+
+        self.alternative_data = alternative_data
+        self.conventional_data = conventional_data
+
 
         # Get formulae - priority: explicit list > file > defaults
         if formulae is not None:
@@ -140,11 +159,18 @@ class LiteratureFormulaEvaluator(LoggerMixin):
             # We need matched datasets for the legacy interface
             # Create them before initializing the manager
             self.predictor_groups = self._create_list_of_predictors()
+
+
+
             matched_datasets_dict = MatchedDataset.multiple_matched_datasets(
                 alternative_fleet=alternative_data,
                 conventional_fleet=conventional_data,
                 logger=self.logger,
-                predictor_groups=self.predictor_groups
+                predictor_groups=self.predictor_groups,
+                eligibility=self.build_eligibility,
+                n_matches_per_ship=self.n_matches_per_ship,
+                caliper=self.caliper,
+                binning_features=self.matched_bins,
             )
 
             # Use first matched dataset as the default matched dataset
@@ -221,12 +247,59 @@ class LiteratureFormulaEvaluator(LoggerMixin):
         # Get default source datasets for matching
         default_source = self.dataset_manager.get_datasets_for_source('default')
 
-        return MatchedDataset.multiple_matched_datasets(
-            alternative_fleet=default_source.get_dataset('alternative'),
-            conventional_fleet=default_source.get_dataset('conventional'),
+        alternative_fleet = default_source.get_dataset('alternative')
+        conventional_fleet = default_source.get_dataset('conventional')
+
+        # --- TEMPORARY DIAGNOSTIC ---
+        for name, frame in (('alternative', alternative_fleet),
+                            ('conventional', conventional_fleet)):
+            duplicated = frame.columns[frame.columns.duplicated()].tolist()
+            print(f'{name}: duplicate labels = {duplicated}')
+
+        for group in self.predictor_groups:
+            features = list(group)
+            width = alternative_fleet[features].shape[1]
+            print(f'group {features}: selects {width} columns, expected {len(features)}')
+        # --- END DIAGNOSTIC ---
+
+        if self.build_eligibility is not None:
+            return MatchedDataset.multiple_matched_datasets(
+                alternative_fleet=alternative_fleet,
+                conventional_fleet=conventional_fleet,
+                logger=self.logger,
+                predictor_groups=self.predictor_groups,
+                eligibility=self.build_eligibility,
+                n_matches_per_ship=self.n_matches_per_ship,
+                caliper=self.caliper,
+                binning_features=self.matched_bins,
+            )
+
+
+        elif self.build_year_col is not None:
+            alt_fleet, conv_fleet = MatchedDataset.add_build_year_window(alternative_fleet, conventional_fleet,
+                                                                         year_column=self.build_year_col, edges=self.year_edges)
+
+            return MatchedDataset.multiple_matched_datasets(
+            alternative_fleet=alt_fleet,
+            conventional_fleet=conv_fleet,
             logger=self.logger,
-            predictor_groups=self.predictor_groups
+            predictor_groups=self.predictor_groups,
+            binning_features = ['BUILD_YEAR_WINDOW'],
+            n_matches_per_ship=self.n_matches_per_ship,
+                caliper=self.caliper
         )
+
+        else:
+
+            return MatchedDataset.multiple_matched_datasets(
+                alternative_fleet=alternative_fleet,
+                conventional_fleet=conventional_fleet,
+                logger=self.logger,
+                predictor_groups=self.predictor_groups,
+                n_matches_per_ship=self.n_matches_per_ship,
+                caliper=self.caliper,
+                binning_features=self.matched_bins,
+            )
 
     def _filter_formulae(self, formulae: List['LiteratureFormula']) -> List['LiteratureFormula']:
         """
@@ -333,6 +406,7 @@ class LiteratureFormulaEvaluator(LoggerMixin):
         """
         result = {
             'formula_name': formula.name,
+            'formula_id':formula.formula_id,
             'formula_type': formula.formula_type,
             'predictors': formula.predictors,
             'target': formula.target,
@@ -514,11 +588,26 @@ class LiteratureFormulaEvaluator(LoggerMixin):
         """
         Evaluate all formulae on all three datasets.
 
-        Returns
-        -------
-        pd.DataFrame
-            Results for all formulae
+        The returned DataFrame has a stable schema: gap columns
+        (``gap_fuel_type``, ``gap_fuel_type_rrmse``, etc.) are guaranteed
+        to exist even when no formula could be evaluated on the
+        alternative dataset (they will simply contain NaN). This allows
+        downstream consumers to filter on these columns without checking
+        for their existence.
+
+        If the alternative dataset is below ``min_alternative_samples``,
+        a warning is issued but conventional and matched evaluation still
+        proceeds, since those results remain valid on their own.
+
+        :param display_results: Whether to print result tables.
+        :type display_results: bool
+        :param metrics: Which metrics to display ('all' or a list).
+        :type metrics: str or list
+        :returns: Results for all formulae with guaranteed gap columns.
+        :rtype: pd.DataFrame
         """
+
+        self.sufficient_alternative_data = self.has_sufficient_alternative_data()
 
         results = []
 
@@ -529,6 +618,17 @@ class LiteratureFormulaEvaluator(LoggerMixin):
             results.append(result)
 
         self.results = pd.DataFrame(results)
+
+        # Guarantee schema stability: ensure all gap columns exist,
+        # filled with NaN where they could not be computed.
+        gap_columns = [
+            'gap_distribution', 'gap_fuel_type', 'gap_total',
+            'gap_distribution_rrmse', 'gap_fuel_type_rrmse', 'gap_total_rrmse',
+            'gap_distribution_mape', 'gap_fuel_type_mape', 'gap_total_mape',
+        ]
+        for col in gap_columns:
+            if col not in self.results.columns:
+                self.results[col] = np.nan
 
         # Display results if requested
         if display_results and self.verbose and len(results) > 0:
@@ -625,7 +725,8 @@ class LiteratureFormulaEvaluator(LoggerMixin):
                         save_path: str = None,
                         show_values: bool = True,
                         variable_name_map: dict[str, str]|None = None,
-                        alternative_name: str|None = None):
+                        alternative_name: str|None = None,
+                        debug:bool=False):
         """
         Plot three-dataset comparison of formula performance.
         Uses ModelPlotter utilities for consistency with domain analysis plots.
@@ -649,7 +750,8 @@ class LiteratureFormulaEvaluator(LoggerMixin):
             return
 
         # Filter valid results
-        valid = self.results.dropna(subset=['gap_fuel_type', 'gap_fuel_type_rrmse'])
+        valid = self._get_valid_results(['gap_fuel_type', 'gap_fuel_type_rrmse'], debug=debug)
+
 
         if len(valid) == 0:
             print("No valid results to plot.")
@@ -764,7 +866,7 @@ class LiteratureFormulaEvaluator(LoggerMixin):
         # Save and show using ModelPlotter
         ModelPlotter.save_and_show(fig, save_path, verbose=True)
 
-    def plot_comparison_scatter(self, save_dir: str = None, figsize: tuple = (18, 6)):
+    def plot_comparison_scatter(self, save_dir: str = None, figsize: tuple = (18, 6), debug:bool=False):
         """
         Create comparison scatter plots for each formula.
 
@@ -793,7 +895,8 @@ class LiteratureFormulaEvaluator(LoggerMixin):
             print(f"\nSaving plots to: {save_path}")
 
         # Filter to valid results
-        valid = self.results.dropna(subset=['gap_fuel_type', 'gap_fuel_type_rrmse'])
+        valid = self._get_valid_results(['gap_fuel_type', 'gap_fuel_type_rrmse'], debug=debug)
+
 
         if len(valid) == 0:
             print("No valid results to plot.")
@@ -942,7 +1045,8 @@ class LiteratureFormulaEvaluator(LoggerMixin):
     def plot_comparison_by_reference(self,
                                      save_path: str = None,
                                      show_values: bool = True,
-                                     variable_name_map: dict[str, str] = None):
+                                     variable_name_map: dict[str, str] = None,
+                                     debug:bool=False):
         """
         Plot three-dataset comparison grouped by reference.
 
@@ -964,7 +1068,8 @@ class LiteratureFormulaEvaluator(LoggerMixin):
             return
 
         # Filter valid results
-        valid = self.results.dropna(subset=['gap_fuel_type', 'gap_fuel_type_rrmse'])
+        valid = self._get_valid_results(['gap_fuel_type', 'gap_fuel_type_rrmse'], debug=debug)
+
 
         if len(valid) == 0:
             print("No valid results to plot.")
@@ -1113,7 +1218,7 @@ class LiteratureFormulaEvaluator(LoggerMixin):
 
         print(f"\n✓ Created {len(references)} comparison plot(s) by reference")
 
-    def plot_formula_fit(self, save_dir: str = None, figsize: tuple = (18, 6), n_points: int = 100):
+    def plot_formula_fit(self, save_dir: str = None, figsize: tuple = (18, 6), n_points: int = 100, debug=False):
         """
         Plot the formula's fitted relationship for each dataset.
 
@@ -1146,7 +1251,8 @@ class LiteratureFormulaEvaluator(LoggerMixin):
             print(f"\nSaving plots to: {save_path}")
 
         # Filter to valid results
-        valid = self.results.dropna(subset=['gap_fuel_type', 'gap_fuel_type_rrmse'])
+        valid = self._get_valid_results(['gap_fuel_type', 'gap_fuel_type_rrmse'], debug=debug)
+
 
         if len(valid) == 0:
             print("No valid results to plot.")
@@ -1377,7 +1483,7 @@ class LiteratureFormulaEvaluator(LoggerMixin):
         if save_dir is not None:
             print(f"\n✓ All formula fit plots saved to {save_path}")
 
-    def plot_residuals(self, save_dir: str = None):
+    def plot_residuals(self, save_dir: str = None, debug=False):
         """
         Create residual plots for each formula showing:
         - Residuals vs Predicted (check for patterns)
@@ -1396,7 +1502,7 @@ class LiteratureFormulaEvaluator(LoggerMixin):
             save_path.mkdir(parents=True, exist_ok=True)
             print(f"\nSaving residual plots to: {save_path}")
 
-        valid = self.results.dropna(subset=['gap_fuel_type'])
+        valid = self._get_valid_results(['gap_fuel_type'], debug=debug)
 
         print(f"\nCreating residual plots for {len(valid)} formulae...")
 
@@ -1674,3 +1780,88 @@ class LiteratureFormulaEvaluator(LoggerMixin):
         # Tester instance only needed for its export method
         tester = BootstrapSignificanceTester()
         tester.export_to_excel(significance_results, output_path)
+
+    def has_sufficient_alternative_data(self, min_samples: int | None = None) -> bool:
+        """
+        Check whether any source-filtered alternative dataset has enough
+        ships to support evaluation.
+
+        Because source filtering only ever removes rows, this checks the
+        alternative dataset for every source referenced by the loaded
+        formulae and returns True if at least one meets the threshold.
+        If none do, no formula can produce alternative metrics and no
+        gap columns will exist in the results.
+
+        :param min_samples: Minimum number of alternative ships required.
+            Defaults to ``self.min_alternative_samples``. Note that 3 is
+            the mechanical minimum for metric computation; statistically
+            meaningful gaps require considerably more.
+        :type min_samples: int or None
+        :returns: True if at least one source's alternative dataset meets
+            the threshold.
+        :rtype: bool
+        """
+        threshold = min_samples if min_samples is not None else self.min_alt_samples
+
+        sources = {f.reference if f.reference else 'default' for f in self.formulae}
+
+        max_n = 0
+        for source in sources:
+            try:
+                alt = self.dataset_manager.get_datasets_for_source(source).get_dataset('alternative')
+                n = len(alt.dropna(how='all'))
+                max_n = max(max_n, n)
+            except (KeyError, AttributeError):
+                continue
+
+        if max_n < threshold and self.verbose:
+            print(f"⚠️  Insufficient alternative fuel data: "
+                  f"largest alternative dataset has {max_n} ships "
+                  f"(minimum {threshold} required). "
+                  f"Gap analysis and comparison plots will be skipped.")
+
+        return max_n >= threshold
+
+    def _get_valid_results(self,
+                           required_cols: list[str],
+                           debug: bool = False) -> pd.DataFrame:
+        """
+        Safely filter ``self.results`` to rows with non-null values in the
+        required columns, tolerating missing columns.
+
+        This replaces direct ``dropna(subset=...)`` calls, which raise
+        ``KeyError`` when a subset column is absent from the DataFrame.
+        Columns can be legitimately absent when the alternative dataset
+        was too small for any formula to produce alternative metrics,
+        in which case gap columns are never created.
+
+        :param required_cols: Columns that must exist and be non-null for
+            a row to be considered valid.
+        :type required_cols: list[str]
+        :param debug: If True, print diagnostic information about which
+            columns are missing and how many rows survive filtering.
+        :type debug: bool
+        :returns: Filtered results; empty DataFrame if results are absent,
+            required columns are missing, or no rows are valid.
+        :rtype: pd.DataFrame
+        """
+        if self.results is None or len(self.results) == 0:
+            if debug:
+                print("  [_get_valid_results] No results available.")
+            return pd.DataFrame()
+
+        missing = [c for c in required_cols if c not in self.results.columns]
+        if missing:
+            if debug or self.verbose:
+                print(f"  [_get_valid_results] Required columns missing from results: {missing}. "
+                      f"This usually means the alternative dataset was too small "
+                      f"for gap analysis. Returning empty result set.")
+            return pd.DataFrame()
+
+        valid = self.results.dropna(subset=required_cols)
+
+        if debug:
+            print(f"  [_get_valid_results] {len(valid)}/{len(self.results)} rows valid "
+                  f"for columns {required_cols}.")
+
+        return valid

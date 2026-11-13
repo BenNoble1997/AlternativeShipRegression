@@ -28,7 +28,7 @@ def get_datasets():
 
     for shiptype,filepath in datafiles.items():
 
-        fleet = pre_processing(filepath=filepath, ship_type=shiptype)
+        fleet = pre_processing(filepath=filepath, shiptype=shiptype)
         dataset = fleet.processed_data['base_with_split_fuels']
         shipdata_dict[shiptype] = dataset
     return shipdata_dict
@@ -96,7 +96,7 @@ def get_database_tuples():
     for shiptype,filepath in datafiles.items():
 
 
-        fleet = getting_alt_fuel_ships(filepath=filepath, ship_type=shiptype)
+        fleet = getting_alt_fuel_ships(filepath=filepath, shiptype=shiptype)
 
         conventional = fleet.processed_data['pure_conventional']
         alt_fuel  = fleet.processed_data['pure_alt_fuel']

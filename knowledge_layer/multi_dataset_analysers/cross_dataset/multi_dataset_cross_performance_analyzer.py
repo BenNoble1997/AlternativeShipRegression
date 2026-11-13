@@ -22,9 +22,11 @@ import pickle
 from knowledge_layer.multi_dataset_analysers.cross_dataset.parametric_cross_dataset_analysis import CrossDatasetPerformanceAnalyzer
 from knowledge_layer.multi_dataset_analysers.cross_dataset.rf_cross_dataset_analysis import RandomForestCrossDatasetAnalyzer
 from knowledge_layer.multi_dataset_analysers.multi_domain_display import MultiDatasetDisplay
+from knowledge_layer.multi_dataset_analysers.cross_dataset.ScaleReference import ScaleReference
+from config.loggermixin.logger_config import LoggerMixin
+from knowledge_layer.fleet_data_class.temporal_eligibility import TemporalEligibility
 
-
-class MultiDatasetCrossPerformanceAnalyzer:
+class MultiDatasetCrossPerformanceAnalyzer(LoggerMixin):
     """
     Analyzes cross-dataset performance across multiple alternative fuel types.
 
@@ -41,55 +43,31 @@ class MultiDatasetCrossPerformanceAnalyzer:
     **Multi-Fuel Comparison**:
     Compare these patterns across LNG, Methanol, Ammonia, etc.
 
-    Examples
-    --------
-    >>> # PARAMETRIC
-    >>> analyzer = MultiDatasetCrossPerformanceAnalyzer(
-    ...     conventional_data=conv_df,
-    ...     alternative_datasets=alternative_datasets,
-    ...     independent_variables=['DWT', 'LOA', 'BEAM'],
-    ...     parametric_selector=selector,
-    ...     analyzer_type='parametric'
-    ... )
-    >>>
-    >>> # RANDOM FOREST
-    >>> analyzer = MultiDatasetCrossPerformanceAnalyzer(
-    ...     conventional_data=conv_df,
-    ...     alternative_datasets=alternative_datasets,
-    ...     independent_variables=['DWT', 'LOA', 'BEAM'],
-    ...     rf_selector=rf_selector,
-    ...     analyzer_type='random_forest',
-    ...     rf_params={'n_estimators': 100, 'max_depth': 10}
-    ... )
-    >>>
-    >>> # Analyze with bootstrap for small samples
-    >>> results = analyzer.analyze_all_datasets(
-    ...     evaluation_method='bootstrap',
-    ...     n_bootstraps=100,
-    ...     max_predictors=2
-    ... )
-    >>>
-    >>> # Compare fuel types
-    >>> analyzer.plot_fuel_type_comparison('LOA')
-    >>> analyzer.print_cross_training_summary()
     """
 
     def __init__(self,
                  conventional_data: pd.DataFrame,
-                 alternative_datasets: Dict[str, pd.DataFrame],
-                 independent_variables: List[str],
-                 dependent_variables: Optional[List[str]] = None,
+                 alternative_datasets: dict[str, pd.DataFrame],
+                 independent_variables: list[str],
+                 dependent_variables: list[str]|None = None,
                  analyzer_type: Literal['parametric', 'random_forest'] = 'parametric',
+                 target_predictor_constraints: dict[str, list[str]] | None = None,
+                 scale_reference:dict|None=None,
+                 selection_metric:str='rrmse',
                  # Parametric-specific
                  parametric_selector=None,
-                 model_recommendations: Optional[Dict] = None,
+                 model_recommendations: dict|None = None,
                  # RF-specific
                  rf_selector=None,
-                 selector_results: Optional[Dict] = None,
-                 rf_params: Optional[Dict] = None,
+                 selector_results: dict|None = None,
+                 rf_params: dict|None = None,
                  # Common
                  random_state: int = 42,
-                 verbose: bool = True):
+                 verbose: bool = True,
+                 debug:bool=False,
+                 build_year_col:str|None=None,
+                 year_edges:list|None=None,
+                 build_eligibility:TemporalEligibility|None=None):
         """
         Initialize multi-dataset cross-performance analyzer.
 
@@ -134,6 +112,20 @@ class MultiDatasetCrossPerformanceAnalyzer:
         self.analyzer_type = analyzer_type
         self.random_state = random_state
         self.verbose = verbose
+        self.debug = debug
+        self.selection_metric = selection_metric
+
+        self.build_year_col = build_year_col
+        self.year_edges = year_edges
+        self.build_eligibility = build_eligibility
+
+        self.set_log_level(verbose=self.verbose, debug=self.debug)
+
+        self.target_predictor_constraints = target_predictor_constraints or {}
+        if not self.target_predictor_constraints:
+            self.logger.warning("No target_predictor_constraints supplied. Candidate selection will "
+            "admit any recommended combination, including circular ones such as "
+            "predicting DRAFT from DEPTH.")
 
         # ========================================================================
         # Extract from selector based on analyzer type
@@ -191,6 +183,20 @@ class MultiDatasetCrossPerformanceAnalyzer:
             self._print_initialization_summary()
 
         self._display = None
+
+        if scale_reference is None:
+            scale_reference = ScaleReference.from_frame(
+                data=conventional_data,
+                targets=self.dependent_variables,
+                source="conventional_cohort_mean",
+            )
+        self.scale_reference = scale_reference
+
+        if self.verbose:
+            print(f"Reference scale: {self.scale_reference.source}")
+            for target, mean in sorted(self.scale_reference.means.items()):
+                print(f"    {target:<10s} {mean:>12.2f}")
+
 
     @property
     def display(self):
@@ -281,7 +287,7 @@ class MultiDatasetCrossPerformanceAnalyzer:
             Evaluation strategy:
             - 'standard-cv': Simple k-fold CV
             - 'repeated-cv': k-fold CV repeated multiple times
-            - 'bootstrap': Bootstrap .632+ (recommended for small datasets)
+            - 'bootstrap': Bootstrap .632+ 
         n_folds : int
             Number of CV folds
         n_repeats : int
@@ -422,7 +428,14 @@ class MultiDatasetCrossPerformanceAnalyzer:
             dependent_variables=self.dependent_variables,
             parametric_selector=self.selector,
             model_recommendations=self.model_recommendations,
+            target_predictor_constraints = self.target_predictor_constraints,
+            scale_reference=self.scale_reference,
             random_state=self.random_state,
+            selection_metric=self.selection_metric,
+            build_year_col=self.build_year_col,
+            year_edges=self.year_edges,
+            build_eligibility=self.build_eligibility,
+            include_matched=False,
             verbose=True  # Suppress individual analyzer verbosity
         )
 
@@ -434,11 +447,18 @@ class MultiDatasetCrossPerformanceAnalyzer:
         analyzer = RandomForestCrossDatasetAnalyzer(
             conventional_data=self.conventional_data,
             alternative_data=alternative_data,
-            variable_dimensions=self.independent_variables,
+            dependent_variables=self.independent_variables,
             target_dimensions=self.dependent_variables,
             selector_results=self.selector_results,
             rf_params=self.rf_params,
             random_state=self.random_state,
+            scale_reference=self.scale_reference,
+            selection_metric=self.selection_metric,
+            target_predictor_constraints=self.target_predictor_constraints,
+            build_year_col=self.build_year_col,
+            year_edges=self.year_edges,
+            build_eligibility=self.build_eligibility,
+            include_matched=False,
             verbose=True  # Suppress individual analyzer verbosity
         )
 
@@ -471,7 +491,7 @@ class MultiDatasetCrossPerformanceAnalyzer:
         # Reorder columns
         priority_cols = [
             'fuel_type', 'target', 'predictor_str', 'model_type',
-            'conv_r2', 'matched_r2', 'alt_r2',
+            'conv_q2', 'matched_q2', 'alt_q2',
             'conv_rrmse', 'matched_rrmse', 'alt_rrmse'
         ]
 
@@ -522,28 +542,28 @@ class MultiDatasetCrossPerformanceAnalyzer:
             print(f"\n{target}")
             print(f"{'─' * 120}")
             print(f"{'Fuel Type':<15s} | {'Predictors':<20s} | "
-                  f"{'Conv R²':>12s} | {'Matched R²':>12s} | {'Alt R²':>12s} | "
+                  f"{'Conv R²':>12s} |  {'Alt R²':>12s} | "
                   f"{'Conv→Alt Δ':>12s}")
             print(f"{'─' * 120}")
 
             for _, row in target_data.iterrows():
-                conv_str = f"{row['conv_r2']:.3f}"
-                matched_str = f"{row['matched_r2']:.3f}"
-                alt_str = f"{row['alt_r2']:.3f}"
+                conv_str = f"{row['conv_q2']:.3f}"
 
-                if show_std and 'conv_r2_std' in row:
-                    conv_str += f"±{row['conv_r2_std']:.3f}"
-                    matched_str += f"±{row['matched_r2_std']:.3f}"
-                    alt_str += f"±{row['alt_r2_std']:.3f}"
+                alt_str = f"{row['alt_q2']:.3f}"
+
+                if show_std and 'conv_q2_std' in row:
+                    conv_str += f"±{row['conv_q2_std']:.3f}"
+
+                    alt_str += f"±{row['alt_q2_std']:.3f}"
 
                 # Calculate drop from conventional to alternative
-                delta = row['conv_r2'] - row['alt_r2']
+                delta = row['conv_q2'] - row['alt_q2']
                 delta_str = f"{delta:+.3f}"
 
                 print(f"{row['fuel_type']:<15s} | "
                       f"{row['predictor_str']:<20s} | "
                       f"{conv_str:>12s} | "
-                      f"{matched_str:>12s} | "
+
                       f"{alt_str:>12s} | "
                       f"{delta_str:>12s}")
 
@@ -553,7 +573,7 @@ class MultiDatasetCrossPerformanceAnalyzer:
 
     def plot_fuel_type_comparison(self,
                                   target: str,
-                                  metric: str = 'r2',
+                                  metric: str = 'q2',
                                   save_path: Optional[str] = None):
         """
         Plot comparison of a specific target across fuel types.
@@ -579,7 +599,7 @@ class MultiDatasetCrossPerformanceAnalyzer:
         # Prepare data for plotting
         fuel_types = target_data['fuel_type'].values
         conv_vals = target_data[f'conv_{metric}'].values
-        matched_vals = target_data[f'matched_{metric}'].values
+
         alt_vals = target_data[f'alt_{metric}'].values
 
         # Create plot
@@ -590,8 +610,7 @@ class MultiDatasetCrossPerformanceAnalyzer:
 
         bars1 = ax.bar(x - width, conv_vals, width, label='Conventional',
                        alpha=0.8, color='#2E86AB')
-        bars2 = ax.bar(x, matched_vals, width, label='Matched',
-                       alpha=0.8, color='#A23B72')
+
         bars3 = ax.bar(x + width, alt_vals, width, label='Alternative',
                        alpha=0.8, color='#F18F01')
 
@@ -615,7 +634,7 @@ class MultiDatasetCrossPerformanceAnalyzer:
         plt.show()
 
     def plot_performance_heatmap(self,
-                                 metric: str = 'alt_r2',
+                                 metric: str = 'alt_q2',
                                  targets: Optional[List[str]] = None,
                                  save_path: Optional[str] = None):
         """
@@ -647,7 +666,7 @@ class MultiDatasetCrossPerformanceAnalyzer:
         fig, ax = plt.subplots(figsize=(12, 6))
 
         im = ax.imshow(pivot_data.values, cmap='RdYlGn', aspect='auto',
-                       vmin=0, vmax=1 if metric.endswith('_r2') else None)
+                       vmin=0, vmax=1 if metric.endswith('_q2') else None)
 
         # Set ticks and labels
         ax.set_xticks(np.arange(len(available_targets)))
@@ -721,13 +740,13 @@ class MultiDatasetCrossPerformanceAnalyzer:
                 'fuel_type': fuel_type,
                 'n_ships': len(self.alternative_datasets[fuel_type]),
                 'n_targets_analyzed': len(ft_data),
-                'mean_conv_r2': ft_data['conv_r2'].mean(),
-                'mean_matched_r2': ft_data['matched_r2'].mean(),
-                'mean_alt_r2': ft_data['alt_r2'].mean(),
+                'mean_conv_q2': ft_data['conv_q2'].mean(),
+                'mean_matched_q2': ft_data['matched_q2'].mean(),
+                'mean_alt_q2': ft_data['alt_q2'].mean(),
                 'mean_conv_rrmse': ft_data['conv_rrmse'].mean(),
                 'mean_matched_rrmse': ft_data['matched_rrmse'].mean(),
                 'mean_alt_rrmse': ft_data['alt_rrmse'].mean(),
-                'mean_performance_drop': (ft_data['conv_r2'] - ft_data['alt_r2']).mean()
+                'mean_performance_drop': (ft_data['conv_q2'] - ft_data['alt_q2']).mean()
             })
 
         return pd.DataFrame(summary_data)
@@ -748,12 +767,12 @@ class MultiDatasetCrossPerformanceAnalyzer:
             summary_data.append({
                 'target': target,
                 'n_fuel_types': len(target_data),
-                'mean_alt_r2': target_data['alt_r2'].mean(),
-                'std_alt_r2': target_data['alt_r2'].std(),
-                'min_alt_r2': target_data['alt_r2'].min(),
-                'max_alt_r2': target_data['alt_r2'].max(),
-                'best_fuel_type': target_data.loc[target_data['alt_r2'].idxmax(), 'fuel_type'],
-                'worst_fuel_type': target_data.loc[target_data['alt_r2'].idxmin(), 'fuel_type']
+                'mean_alt_q2': target_data['alt_q2'].mean(),
+                'std_alt_q2': target_data['alt_q2'].std(),
+                'min_alt_q2': target_data['alt_q2'].min(),
+                'max_alt_q2': target_data['alt_q2'].max(),
+                'best_fuel_type': target_data.loc[target_data['alt_q2'].idxmax(), 'fuel_type'],
+                'worst_fuel_type': target_data.loc[target_data['alt_q2'].idxmin(), 'fuel_type']
             })
 
         return pd.DataFrame(summary_data)

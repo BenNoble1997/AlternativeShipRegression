@@ -129,7 +129,7 @@ class MultiCrossPerformanceLatexTableGenerator:
             LaTeX table code
         """
         # Filter data
-        df = self._filter_and_prepare_data(targets, max_predictors, best_only, 'alt_r2')
+        df = self._filter_and_prepare_data(targets, max_predictors, best_only, 'alt_q2')
 
         if len(df) == 0:
             if self.verbose:
@@ -142,11 +142,12 @@ class MultiCrossPerformanceLatexTableGenerator:
             eval_method = df['evaluation_method'].iloc[0] if 'evaluation_method' in df.columns else 'CV'
 
             caption = (
-                f"Cross-training $R^{{2}}$ performance for {len(df['target'].unique())} target dimensions "
+                f"Cross dataset performance of regression models  $R^{{2}}$ performance for {len(df['target'].unique())} target dimensions "
                 f"across multiple alternative fuel types ({fuel_list}) for {ship_type.string} vessels. "
-                f"Evaluation: {eval_method}. "
+                f"Evaluation: {eval_method} "
                 f"Conv = trained on conventional ships, Alt = trained on alternative ships. "
-                f"Showing best predictor combination per target (max {max_predictors} predictors)."
+                f"Values that are negative, or whose standard deviation exceeds the magnitude of the estimate,"
+                f" are shown in \textcolor{{red}}{{red}}."
             )
 
         if label is None:
@@ -319,8 +320,8 @@ class MultiCrossPerformanceLatexTableGenerator:
         parts.append(model_str)
 
         # Conventional performance (same for all fuel types)
-        conv_r2 = first_row['conv_r2']
-        conv_std = first_row.get('conv_r2_std', 0)
+        conv_r2 = first_row['conv_q2']
+        conv_std = first_row.get('conv_q2_std', 0)
         parts.append(self.formatter.format_r2_with_std(conv_r2, conv_std))
 
         # Metrics for each fuel type
@@ -337,13 +338,13 @@ class MultiCrossPerformanceLatexTableGenerator:
 
                 if include_matched:
                     # Matched R²
-                    match_r2 = fuel_data['matched_r2']
-                    match_std = fuel_data.get('matched_r2_std', 0)
+                    match_r2 = fuel_data['matched_q2']
+                    match_std = fuel_data.get('matched_q2_std', 0)
                     parts.append(self.formatter.format_r2_with_std(match_r2, match_std))
 
                 # Alternative R²
-                alt_r2 = fuel_data['alt_r2']
-                alt_std = fuel_data.get('alt_r2_std', 0)
+                alt_r2 = fuel_data['alt_q2']
+                alt_std = fuel_data.get('alt_q2_std', 0)
 
                 # ✅ Highlight if significant drop from conventional
                 performance_drop = conv_r2 - alt_r2
@@ -646,94 +647,6 @@ class MultiCrossPerformanceLatexTableGenerator:
 
         return df
 
-    # ========================================================================
-    # SAVE METHODS
-    # ========================================================================
-    #
-    # def save_tables(self,
-    #                 ship_type: ShipType,
-    #                 output_dir: str = '.',
-    #                 targets: Optional[List[str]] = None,
-    #                 max_predictors: int = 2,
-    #                 prefix: str = None,
-    #                 best_only: bool = True,
-    #                 include_matched: bool = False,
-    #                 landscape: bool = False) -> Dict[str, Path]:
-    #     """
-    #     Generate and save both R² and RRMSE tables.
-    #
-    #     Parameters
-    #     ----------
-    #     ship_type : ShipType
-    #         Ship type for tables
-    #     output_dir : str
-    #         Directory to save files
-    #     targets : List[str], optional
-    #         Specific targets to include
-    #     max_predictors : int
-    #         Maximum number of predictors
-    #     prefix : str, optional
-    #         Filename prefix
-    #     best_only : bool
-    #         If True, show only best combination per target
-    #     include_matched : bool, default=False
-    #         If True, include matched dataset columns.
-    #         **Recommended False** for cleaner cross-training tables.
-    #     landscape : bool
-    #         If True, use sidewaystable (recommended for >2 fuel types)
-    #
-    #     Returns
-    #     -------
-    #     dict
-    #         Paths to saved files
-    #     """
-    #     output_path = Path(output_dir)
-    #     output_path.mkdir(parents=True, exist_ok=True)
-    #
-    #     if prefix is None:
-    #         prefix = "cross_performance"
-    #
-    #     # Generate tables
-    #     r2_table = self.generate_r2_table(
-    #         ship_type=ship_type,
-    #         targets=targets,
-    #         max_predictors=max_predictors,
-    #         best_only=best_only,
-    #         include_matched=include_matched,
-    #         landscape=landscape
-    #     )
-    #
-    #     rrmse_table = self.generate_rrmse_table(
-    #         ship_type=ship_type,
-    #         targets=targets,
-    #         max_predictors=max_predictors,
-    #         best_only=best_only,
-    #         include_matched=include_matched,
-    #         landscape=landscape
-    #     )
-    #
-    #     # Save files
-    #     r2_path = output_path / f"{ship_type.name}_{prefix}_r2.tex"
-    #     rrmse_path = output_path / f"{ship_type.name}_{prefix}_rrmse.tex"
-    #
-    #     r2_path.write_text(r2_table)
-    #     rrmse_path.write_text(rrmse_table)
-    #
-    #     # Save preamble
-    #     preamble_path = output_path / f"{ship_type.name}_{prefix}_preamble.tex"
-    #     LaTeXPreambleGenerator.save_preamble(str(preamble_path))
-    #
-    #     if self.verbose:
-    #         print(f"✅ Cross-performance tables saved:")
-    #         print(f"   R² table:    {r2_path}")
-    #         print(f"   RRMSE table: {rrmse_path}")
-    #         print(f"   Preamble:    {preamble_path}")
-    #
-    #     return {
-    #         'r2': r2_path,
-    #         'rrmse': rrmse_path,
-    #         'preamble': preamble_path
-    #     }
 
     @staticmethod
     def print_latex_preamble():
@@ -781,7 +694,7 @@ class MultiCrossPerformanceLatexTableGenerator:
         This format is more compact than separate R² and RRMSE tables.
         """
         # Filter data
-        df = self._filter_and_prepare_data(targets, max_predictors, best_only, 'alt_r2')
+        df = self._filter_and_prepare_data(targets, max_predictors, best_only, 'alt_q2')
 
         if len(df) == 0:
             if self.verbose:
@@ -798,7 +711,6 @@ class MultiCrossPerformanceLatexTableGenerator:
                 f"across multiple alternative fuel types ({fuel_list}) for {ship_type.string} vessels. "
                 f"Evaluation: {eval_method}. "
                 f"Conv = trained on conventional ships, Alt = trained on alternative ships. "
-                f"Showing best predictor combination per target (max {max_predictors} predictors)."
             )
 
         if label is None:
@@ -945,8 +857,8 @@ class MultiCrossPerformanceLatexTableGenerator:
         parts.append(model_str)
 
         # Conventional performance (same for all fuel types)
-        conv_r2 = first_row['conv_r2']
-        conv_r2_std = first_row.get('conv_r2_std', 0)
+        conv_r2 = first_row['conv_q2']
+        conv_r2_std = first_row.get('conv_q2_std', 0)
         conv_rrmse = first_row['conv_rrmse']
         conv_rrmse_std = first_row.get('conv_rrmse_std', 0)
 
@@ -963,8 +875,8 @@ class MultiCrossPerformanceLatexTableGenerator:
                 fuel_data = fuel_row.iloc[0]
 
                 # Alternative R²
-                alt_r2 = fuel_data['alt_r2']
-                alt_r2_std = fuel_data.get('alt_r2_std', 0)
+                alt_r2 = fuel_data['alt_q2']
+                alt_r2_std = fuel_data.get('alt_q2_std', 0)
                 alt_rrmse = fuel_data['alt_rrmse']
                 alt_rrmse_std = fuel_data.get('alt_rrmse_std', 0)
 

@@ -59,7 +59,8 @@ class DistributionComparison:
                                 n_bootstrap=10000,
                                 ci_method:str='percentile',
                                 confidence_level=0.95,
-                                debug:bool=False):
+                                debug:bool=False,
+                                plot:bool=False):
         """
         Bootstrap confidence interval for the difference in medians/means.
 
@@ -152,36 +153,38 @@ class DistributionComparison:
             print(f"Mean CI: [{mean_ci[0]:.4f}, {mean_ci[1]:.4f}]")
             print(f"Mean significant: {mean_significant}")
 
-        # Visualization
-        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        if plot:
 
-        # Median difference
-        axes[0].hist(bootstrap_median_diffs, bins=50, alpha=0.7, edgecolor='black')
-        axes[0].axvline(observed_median_diff, color='red', linestyle='--',
-                        linewidth=2, label=f'Observed: {observed_median_diff:.2f}')
-        axes[0].axvline(median_ci[0], color='green', linestyle=':', linewidth=2)
-        axes[0].axvline(median_ci[1], color='green', linestyle=':', linewidth=2)
-        axes[0].axvline(0, color='black', linestyle='-', linewidth=1, alpha=0.5)
-        axes[0].set_xlabel(f'Difference in Median {feature}')
-        axes[0].set_ylabel('Frequency')
-        axes[0].set_title(
-            f'Bootstrap Distribution: Median Difference\n95% CI: [{median_ci[0]:.2f}, {median_ci[1]:.2f}]')
-        axes[0].legend()
+            # Visualization
+            fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
-        # Mean difference
-        axes[1].hist(bootstrap_mean_diffs, bins=50, alpha=0.7, edgecolor='black')
-        axes[1].axvline(observed_mean_diff, color='red', linestyle='--',
-                        linewidth=2, label=f'Observed: {observed_mean_diff:.2f}')
-        axes[1].axvline(mean_ci[0], color='green', linestyle=':', linewidth=2)
-        axes[1].axvline(mean_ci[1], color='green', linestyle=':', linewidth=2)
-        axes[1].axvline(0, color='black', linestyle='-', linewidth=1, alpha=0.5)
-        axes[1].set_xlabel(f'Difference in Mean {feature}')
-        axes[1].set_ylabel('Frequency')
-        axes[1].set_title(f'Bootstrap Distribution: Mean Difference\n95% CI: [{mean_ci[0]:.2f}, {mean_ci[1]:.2f}]')
-        axes[1].legend()
+            # Median difference
+            axes[0].hist(bootstrap_median_diffs, bins=50, alpha=0.7, edgecolor='black')
+            axes[0].axvline(observed_median_diff, color='red', linestyle='--',
+                            linewidth=2, label=f'Observed: {observed_median_diff:.2f}')
+            axes[0].axvline(median_ci[0], color='green', linestyle=':', linewidth=2)
+            axes[0].axvline(median_ci[1], color='green', linestyle=':', linewidth=2)
+            axes[0].axvline(0, color='black', linestyle='-', linewidth=1, alpha=0.5)
+            axes[0].set_xlabel(f'Difference in Median {feature}')
+            axes[0].set_ylabel('Frequency')
+            axes[0].set_title(
+                f'Bootstrap Distribution: Median Difference\n95% CI: [{median_ci[0]:.2f}, {median_ci[1]:.2f}]')
+            axes[0].legend()
 
-        plt.tight_layout()
-        plt.show()
+            # Mean difference
+            axes[1].hist(bootstrap_mean_diffs, bins=50, alpha=0.7, edgecolor='black')
+            axes[1].axvline(observed_mean_diff, color='red', linestyle='--',
+                            linewidth=2, label=f'Observed: {observed_mean_diff:.2f}')
+            axes[1].axvline(mean_ci[0], color='green', linestyle=':', linewidth=2)
+            axes[1].axvline(mean_ci[1], color='green', linestyle=':', linewidth=2)
+            axes[1].axvline(0, color='black', linestyle='-', linewidth=1, alpha=0.5)
+            axes[1].set_xlabel(f'Difference in Mean {feature}')
+            axes[1].set_ylabel('Frequency')
+            axes[1].set_title(f'Bootstrap Distribution: Mean Difference\n95% CI: [{mean_ci[0]:.2f}, {mean_ci[1]:.2f}]')
+            axes[1].legend()
+
+            plt.tight_layout()
+            plt.show()
 
         # Results
         results = {

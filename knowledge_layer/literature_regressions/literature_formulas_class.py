@@ -82,6 +82,19 @@ class LiteratureFormula:
 
         self.predict_func = self._build_prediction_function()
 
+    @property
+    def formula_id(self) -> str:
+        """
+        Unique key for joins and lookups.
+
+        `name` is a display label and is not unique: two sources can publish the
+        same functional form for the same predictor-target pair. Anything that
+        merges, groups or looks up per-formula results must use this instead.
+        """
+        preds = '_'.join(p.replace(' ', '_') for p in self.predictors)
+        ref = str(self.reference).replace(' ', '_') if self.reference else 'na'
+        return f"{preds}_to_{self.target.replace(' ', '_')}_{self.formula_type}_ref{ref}"
+
     def _normalize_domain_limits(self):
         """
         Normalize domain_lower and domain_upper to dict format internally.

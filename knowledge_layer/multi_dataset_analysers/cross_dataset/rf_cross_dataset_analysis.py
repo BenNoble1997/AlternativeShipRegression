@@ -17,7 +17,8 @@ from sklearn.metrics import r2_score
 from knowledge_layer.multi_dataset_analysers.rf_analysis_foundation import RandomForestAnalysisFoundation
 from knowledge_layer.multi_dataset_analysers.small_dataset_evaluation import SmallDatasetEvaluator
 from knowledge_layer.Metrics.regression_metrics_class import RegressionMetrics
-
+from knowledge_layer.multi_dataset_analysers.cross_dataset.ScaleReference import ScaleReference
+from knowledge_layer.fleet_data_class.temporal_eligibility import TemporalEligibility
 
 class RandomForestCrossDatasetAnalyzer:
     """
@@ -45,24 +46,40 @@ class RandomForestCrossDatasetAnalyzer:
     def __init__(self,
                  conventional_data: pd.DataFrame,
                  alternative_data: pd.DataFrame,
-                 variable_dimensions: List[str],
-                 target_dimensions: Optional[List[str]] = None,
-                 selector_results: Optional[Dict] = None,
-                 rf_params: Optional[Dict] = None,
+                 dependent_variables: list[str],
+                 target_dimensions: list[str]|None = None,
+                 selector_results: dict|None = None,
+                 rf_params: dict|None = None,
+                 target_predictor_constraints: dict[str, list[str]] | None = None,
+                 scale_reference:ScaleReference|None=None,
                  random_state: int = 42,
-                 verbose: bool = True):
-        """Initialize analyzer with foundation and evaluator."""
+                 verbose: bool = True,
+                 build_year_col:str|None=None,
+                 year_edges:list|None=None,
+                 selection_metric:str = 'rrmse',
+                 build_eligibility:TemporalEligibility|None=None,
+                 include_matched:bool=False):
+        """Initialize analyzer with foundation and evaluator to the foundation so that candidate filtering matches Experiment 2.
+        :param target_predictor_constraints: Allowed predictors per target, forwarded
+
+    """
 
         # Foundation for data management
         self.foundation = RandomForestAnalysisFoundation(
             conventional_data=conventional_data,
             alternative_data=alternative_data,
-            variable_dimensions=variable_dimensions,
+            variable_dimensions=dependent_variables,
             target_dimensions=target_dimensions,
             selector_results=selector_results,
+            target_predictor_constraints=target_predictor_constraints,
+            selection_metric=selection_metric,
             rf_params=rf_params,
             random_state=random_state,
-            verbose=verbose
+            verbose=verbose,
+            defer_matched_sets=not include_matched,
+            build_year_col=build_year_col,
+            year_edges=year_edges,
+            eligibility=build_eligibility
         )
 
         # ✅ Evaluator for multiple evaluation strategies
@@ -72,6 +89,14 @@ class RandomForestCrossDatasetAnalyzer:
             random_state=random_state,
             verbose=verbose
         )
+
+        if scale_reference is None:
+            scale_reference = ScaleReference.from_frame(data = conventional_data,
+                                                        targets=self.foundation.target_dimensions,
+                                                        source = "conventional_cohort_mean")
+
+        self.scale_reference = scale_reference
+        self.include_matched = include_matched
 
         self.random_state = random_state
         self.verbose = verbose
@@ -232,10 +257,11 @@ class RandomForestCrossDatasetAnalyzer:
         # Add bootstrap-specific columns if using bootstrap
         if evaluation_method == 'bootstrap':
             bootstrap_cols = [
-                'conv_r2_oob', 'conv_r2_train', 'conv_r2_relative_overfitting',
-                'matched_r2_oob', 'matched_r2_train', 'matched_r2_relative_overfitting',
-                'alt_r2_oob', 'alt_r2_train', 'alt_r2_relative_overfitting',
-            ]
+                                 f'{prefix}_{metric}_{part}'
+                                 for prefix in ('conv', 'matched', 'alt')
+                                 for metric in ('r2', 'adj_r2', 'rrmse')
+                                 for part in ('train', 'oob')
+                             ] + [f'{prefix}_relative_overfitting' for prefix in ('conv', 'matched', 'alt')]
             column_order.extend(bootstrap_cols)
 
         # Add feature importance columns
@@ -264,20 +290,19 @@ class RandomForestCrossDatasetAnalyzer:
                                              n_bootstraps: int) -> Optional[Dict]:
         """Evaluate on three datasets using selected method."""
         # Get matched dataset
-        predictor_key = tuple(predictors)
-        matched_dataset = self.foundation.get_matched_dataset(predictor_key)
+        datasets = {'conv': self.conventional_full}
 
-        if matched_dataset is None:
-            if self.verbose:
-                print(f"    ⚠️  No matched dataset for {predictors}")
-            return None
+        if self.include_matched:
+            matched_dataset = self.foundation.get_matched_dataset(tuple(predictors))
 
-        # Prepare datasets
-        datasets = {
-            'conv': self.conventional_full,
-            'matched': matched_dataset,
-            'alt': self.alternative
-        }
+            if matched_dataset is None:
+                if self.verbose:
+                    print(f"    ⚠️  No matched dataset for {predictors}")
+                return None
+
+            datasets['matched'] = matched_dataset
+
+        datasets['alt'] = self.alternative
 
         results = {}
         feature_importances = []
@@ -324,13 +349,14 @@ class RandomForestCrossDatasetAnalyzer:
 
     def _evaluate_on_dataset(self,
                              dataset: pd.DataFrame,
-                             predictors: List[str],
+                             predictors: list[str],
                              target: str,
                              dataset_name: str,
                              evaluation_method: str,
                              n_folds: int,
                              n_repeats: int,
-                             n_bootstraps: int) -> Optional[Dict]:
+                             n_bootstraps: int,
+                             debug:bool=False) -> dict:
         """
         Evaluate using selected evaluation strategy.
 
@@ -348,6 +374,19 @@ class RandomForestCrossDatasetAnalyzer:
         X, y = data_prep
         n_samples = len(X)
 
+        reference_scale = (None if self.scale_reference is None else self.scale_reference.for_target(target))
+
+        if debug:
+            local_mean = float(np.mean(y))
+            if reference_scale is None:
+                print(f"      [scale] {dataset_name}/{target}: cohort-local "
+                      f"divisor={local_mean:.3f}")
+            else:
+                ratio = local_mean / reference_scale
+                print(f"      [scale] {dataset_name}/{target}: fixed "
+                      f"divisor={reference_scale:.3f}, cohort mean={local_mean:.3f} "
+                      f"(ratio {ratio:.3f})")
+
         if self.verbose:
             print(f"    {dataset_name}: {evaluation_method} (n={n_samples})")
 
@@ -361,7 +400,7 @@ class RandomForestCrossDatasetAnalyzer:
             result = self.evaluator.standard_cv(
                 X, y, 'random_forest',
                 n_folds=n_folds,
-                model_params=self.foundation.rf_params
+                model_params=self.foundation.rf_params, reference_scale=reference_scale
             )
 
         elif evaluation_method == 'repeated-cv':
@@ -369,14 +408,14 @@ class RandomForestCrossDatasetAnalyzer:
                 X, y, 'random_forest',
                 n_folds=n_folds,
                 n_repeats=n_repeats,
-                model_params=self.foundation.rf_params
+                model_params=self.foundation.rf_params, reference_scale=reference_scale
             )
 
         elif evaluation_method == 'bootstrap':
             result = self.evaluator.bootstrap_632_plus(
                 X, y, 'random_forest',
                 n_bootstraps=n_bootstraps,
-                model_params=self.foundation.rf_params
+                model_params=self.foundation.rf_params, reference_scale=reference_scale
             )
 
         else:
@@ -408,7 +447,7 @@ class RandomForestCrossDatasetAnalyzer:
             result = standardized
 
         if self.verbose:
-            print(f"        → R²={result['r2']:.3f}±{result.get('r2_std', 0):.3f}, "
+            print(f"        → R²={result['q2']:.3f}±{result.get('q2_std', 0):.3f}, "
                   f"RRMSE={result['rrmse']:.1f}±{result.get('rrmse_std', 0):.1f}%")
 
         return result
@@ -451,7 +490,7 @@ class RandomForestCrossDatasetAnalyzer:
     # ========================================================================
 
     def _rf_standard_cv(self, X: np.ndarray, y: np.ndarray,
-                        predictors: List[str], n_folds: int) -> Optional[Dict]:
+                        predictors: List[str], n_folds: int, reference_scale:float|None) -> Optional[Dict]:
         """Standard k-fold CV for Random Forest."""
         from sklearn.model_selection import KFold
 
@@ -469,9 +508,9 @@ class RandomForestCrossDatasetAnalyzer:
                 rf.fit(X_train, y_train)
                 y_pred = rf.predict(X_test)
 
-                metric_calc = RegressionMetrics(y_test, y_pred)
+                metric_calc = RegressionMetrics(y_test, y_pred, reference=reference_scale)
                 metrics = {
-                    'r2': r2_score(y_test, y_pred),
+                    'q2': r2_score(y_test, y_pred),
                     'rrmse': metric_calc.calculate_rrmse(),
                     'rmse': metric_calc.calculate_rmse(),
                     'mae': metric_calc.calculate_mae(),
@@ -508,8 +547,9 @@ class RandomForestCrossDatasetAnalyzer:
         return avg_metrics
 
     def _rf_repeated_cv(self, X: np.ndarray, y: np.ndarray,
-                        predictors: List[str], n_folds: int,
-                        n_repeats: int) -> Optional[Dict]:
+                        predictors: list[str], n_folds: int,
+                        n_repeats: int,
+                        reference_scale:float|None) -> Optional[Dict]:
         """Repeated k-fold CV for Random Forest."""
         all_metrics = []
         all_importances = []
@@ -558,8 +598,9 @@ class RandomForestCrossDatasetAnalyzer:
         return avg_metrics
 
     def _rf_bootstrap_632_plus(self, X: np.ndarray, y: np.ndarray,
-                               predictors: List[str],
-                               n_bootstraps: int) -> Optional[Dict]:
+                               predictors: list[str],
+                               n_bootstraps: int,
+                               reference_scale:float|None) -> dict:
         """Bootstrap .632+ evaluation for Random Forest."""
         n_samples = len(X)
 
@@ -586,17 +627,17 @@ class RandomForestCrossDatasetAnalyzer:
 
                 # Training performance
                 y_train_pred = rf.predict(X_boot)
-                train_calc = RegressionMetrics(y_boot, y_train_pred)
+                train_calc = RegressionMetrics(y_true=y_boot,y_pred= y_train_pred, reference=reference_scale)
                 train_metrics = {
-                    'r2': r2_score(y_boot, y_train_pred),
+                    'q2': r2_score(y_boot, y_train_pred),
                     'rrmse': train_calc.calculate_rrmse()
                 }
 
                 # OOB performance
                 y_oob_pred = rf.predict(X_oob)
-                oob_calc = RegressionMetrics(y_oob, y_oob_pred)
+                oob_calc = RegressionMetrics(y_true=y_oob, y_pred=y_oob_pred, reference=reference_scale)
                 oob_metrics = {
-                    'r2': r2_score(y_oob, y_oob_pred),
+                    'q2': r2_score(y_oob, y_oob_pred),
                     'rrmse': oob_calc.calculate_rrmse()
                 }
 
@@ -611,31 +652,31 @@ class RandomForestCrossDatasetAnalyzer:
             return None
 
         # Calculate .632+ corrected metrics
-        avg_train_r2 = np.mean([m['r2'] for m in train_metrics_list])
-        avg_oob_r2 = np.mean([m['r2'] for m in oob_metrics_list])
+        avg_train_q2 = np.mean([m['q2'] for m in train_metrics_list])
+        avg_oob_q2 = np.mean([m['q2'] for m in oob_metrics_list])
 
         avg_train_rrmse = np.mean([m['rrmse'] for m in train_metrics_list])
         avg_oob_rrmse = np.mean([m['rrmse'] for m in oob_metrics_list])
 
         # Relative overfitting rate
-        if avg_train_r2 > avg_oob_r2:
-            R_r2 = min((avg_train_r2 - avg_oob_r2) / max(avg_train_r2, 0.001), 1.0)
+        if avg_train_q2 > avg_oob_q2:
+            R_q2 = min((avg_train_q2 - avg_oob_q2) / max(avg_train_q2, 0.001), 1.0)
         else:
-            R_r2 = 0.0
+            R_q2 = 0.0
 
         # .632+ weights
-        w = 0.632 / (1 - 0.368 * R_r2)
+        w = 0.632 / (1 - 0.368 * R_q2)
 
         # Corrected estimates
-        r2_632plus = w * avg_oob_r2 + (1 - w) * avg_train_r2
+        q2_632plus = w * avg_oob_q2 + (1 - w) * avg_train_q2
         rrmse_632plus = w * avg_oob_rrmse + (1 - w) * avg_train_rrmse
 
         result = {
-            'r2': r2_632plus,
-            'r2_std': np.std([m['r2'] for m in oob_metrics_list]),
-            'r2_train': avg_train_r2,
-            'r2_oob': avg_oob_r2,
-            'r2_relative_overfitting': R_r2,
+            'q2': q2_632plus,
+            'q2_std': np.std([m['q2'] for m in oob_metrics_list]),
+            'q2_train': avg_train_q2,
+            'q2_oob': avg_oob_q2,
+            'q2_relative_overfitting': R_q2,
             'rrmse': rrmse_632plus,
             'rrmse_std': np.std([m['rrmse'] for m in oob_metrics_list]),
             'rrmse_train': avg_train_rrmse,
@@ -674,7 +715,7 @@ class RandomForestCrossDatasetAnalyzer:
         print("=" * 160)
 
         # Check for high variance
-        high_variance_targets = results_df[results_df['alt_r2_std'] > 0.3]['target'].tolist()
+        high_variance_targets = results_df[results_df['alt_q2_std'] > 0.3]['target'].tolist()
         if high_variance_targets:
             print(f"\n⚠️  High variance on alternative dataset for: {', '.join(high_variance_targets)}")
             print("      This is expected given small sample size (n≈18)")
@@ -685,8 +726,8 @@ class RandomForestCrossDatasetAnalyzer:
 
         # Main table
         print(f"\n{'Target':<15s} | {'Predictors':<25s} | {'Model':<15s} | "
-              f"{'Conv R²':>15s} | {'Matched R²':>15s} | {'Alt R²':>15s}")
-
+              # f"{'Conv R²':>15s} | {'Matched R²':>15s} | {'Alt R²':>15s}")
+        f"{'Conv R²':>15s} |  {'Alt R²':>15s}")
         if evaluation_method == 'bootstrap':
             print(f"{'':15s} | {'':25s} | {'':15s} | "
                   f"{'(train→OOB→.632+)':>15s} | {'(train→OOB→.632+)':>15s} | "
@@ -695,32 +736,32 @@ class RandomForestCrossDatasetAnalyzer:
         print("-" * 160)
 
         for _, row in results_df.iterrows():
-            conv_str = f"{row['conv_r2']:>6.3f}±{row['conv_r2_std']:>5.3f}"
-            matched_str = f"{row['matched_r2']:>6.3f}±{row['matched_r2_std']:>5.3f}"
+            conv_str = f"{row['conv_q2']:>6.3f}±{row['conv_q2_std']:>5.3f}"
+            # matched_str = f"{row['matched_r2']:>6.3f}±{row['matched_r2_std']:>5.3f}"
 
-            if row['alt_r2_std'] > 0.3:
-                alt_str = f"{row['alt_r2']:>6.3f}±{row['alt_r2_std']:>5.3f}*"
+            if row['alt_q2_std'] > 0.3:
+                alt_str = f"{row['alt_q2']:>6.3f}±{row['alt_q2_std']:>5.3f}*"
             else:
-                alt_str = f"{row['alt_r2']:>6.3f}±{row['alt_r2_std']:>5.3f} "
+                alt_str = f"{row['alt_q2']:>6.3f}±{row['alt_q2_std']:>5.3f} "
 
             print(f"{row['target']:<15s} | "
                   f"{row['predictor_str']:<25s} | "
                   f"{row['model_type']:<15s} | "
                   f"{conv_str:>15s} | "
-                  f"{matched_str:>15s} | "
+                  # f"{matched_str:>15s} | "
                   f"{alt_str:>15s}")
 
             if evaluation_method == 'bootstrap':
-                conv_decomp = f"({row.get('conv_r2_train', 0):.2f}→{row.get('conv_r2_oob', 0):.2f}→{row['conv_r2']:.2f})"
-                matched_decomp = f"({row.get('matched_r2_train', 0):.2f}→{row.get('matched_r2_oob', 0):.2f}→{row['matched_r2']:.2f})"
-                alt_decomp = f"({row.get('alt_r2_train', 0):.2f}→{row.get('alt_r2_oob', 0):.2f}→{row['alt_r2']:.2f})"
+                conv_decomp = f"({row.get('conv_q2_train', 0):.2f}→{row.get('conv_q2_oob', 0):.2f}→{row['conv_q2']:.2f})"
+                # matched_decomp = f"({row.get('matched_r2_train', 0):.2f}→{row.get('matched_r2_oob', 0):.2f}→{row['matched_r2']:.2f})"
+                alt_decomp = f"({row.get('alt_q2_train', 0):.2f}→{row.get('alt_q2_oob', 0):.2f}→{row['alt_q2']:.2f})"
 
-                alt_overfit = row.get('alt_r2_relative_overfitting', 0)
+                alt_overfit = row.get('alt_q2_relative_overfitting', 0)
                 overfit_marker = "⚠️" if alt_overfit > 0.5 else ""
 
                 print(f"{'':15s} | {'':25s} | {'':15s} | "
                       f"{conv_decomp:>15s} | "
-                      f"{matched_decomp:>15s} | "
+                      # f"{matched_decomp:>15s} | "
                       f"{alt_decomp:>15s} {overfit_marker}")
 
         print("=" * 160)
@@ -733,21 +774,21 @@ class RandomForestCrossDatasetAnalyzer:
         print("\nSUMMARY:")
         print(f"  Dataset sizes (mean):")
         print(f"    Conventional:  n={results_df['conv_n'].iloc[0]:.0f}")
-        print(f"    Matched:       n={results_df['matched_n'].mean():.0f}")
+        # print(f"    Matched:       n={results_df['matched_n'].mean():.0f}")
         print(f"    Alternative:   n={results_df['alt_n'].mean():.0f}")
 
         print(f"\n  Mean performance:")
-        print(f"    Conventional R²:  {results_df['conv_r2'].mean():.3f} "
-              f"(mean std: {results_df['conv_r2_std'].mean():.3f})")
-        print(f"    Matched R²:       {results_df['matched_r2'].mean():.3f} "
-              f"(mean std: {results_df['matched_r2_std'].mean():.3f})")
-        print(f"    Alternative R²:   {results_df['alt_r2'].mean():.3f} "
-              f"(mean std: {results_df['alt_r2_std'].mean():.3f})")
+        print(f"    Conventional R²:  {results_df['conv_q2'].mean():.3f} "
+              f"(mean std: {results_df['conv_q2_std'].mean():.3f})")
+        # print(f"    Matched R²:       {results_df['matched_r2'].mean():.3f} "
+        #       f"(mean std: {results_df['matched_r2_std'].mean():.3f})")
+        print(f"    Alternative R²:   {results_df['alt_q2'].mean():.3f} "
+              f"(mean std: {results_df['alt_q2_std'].mean():.3f})")
 
         if evaluation_method == 'bootstrap':
             print(f"\n  Overfitting analysis (alternative dataset):")
-            avg_overfit = results_df['alt_r2_relative_overfitting'].mean()
-            severe_overfit = (results_df['alt_r2_relative_overfitting'] > 0.5).sum()
+            avg_overfit = results_df['alt_q2_relative_overfitting'].mean()
+            severe_overfit = (results_df['alt_q2_relative_overfitting'] > 0.5).sum()
 
             print(f"    Mean relative overfitting (R): {avg_overfit:.2f}")
             print(f"    Targets with severe overfitting (R>0.5): {severe_overfit}/{len(results_df)}")
@@ -759,7 +800,7 @@ class RandomForestCrossDatasetAnalyzer:
         if 'conv_n_evaluations' in results_df.columns:
             print(f"\n  Evaluation completeness:")
             print(f"    Conventional:  {results_df['conv_n_evaluations'].mean():.0f} evaluations")
-            print(f"    Matched:       {results_df['matched_n_evaluations'].mean():.0f} evaluations")
+            # print(f"    Matched:       {results_df['matched_n_evaluations'].mean():.0f} evaluations")
             print(f"    Alternative:   {results_df['alt_n_evaluations'].mean():.0f} evaluations")
 
         print("=" * 160)

@@ -22,6 +22,8 @@ from knowledge_layer.multi_dataset_analysers.domain_shift_plotting_class import 
 )
 from knowledge_layer.model_selectors.parametric_formula_latex_generator_class import ParametricFormulaLatexGenerator
 
+from knowledge_layer.fleet_data_class.temporal_eligibility import TemporalEligibility
+
 from knowledge_layer.multi_dataset_analysers.multi_domain_display import MultiDatasetDisplay
 
 class MultiDatasetDomainAnalyzer:
@@ -31,25 +33,7 @@ class MultiDatasetDomainAnalyzer:
     **Design**: Uses composition - creates separate analyzer for each fuel type,
     then aggregates and compares results.
 
-    Examples
-    --------
-    >>> alternative_datasets = {
-    ...     'LNG': lng_ships_df,
-    ...     'Methanol': methanol_ships_df,
-    ...     'Ammonia': ammonia_ships_df
-    ... }
-    >>>
-    >>> analyzer = MultiDatasetDomainAnalyzer(
-    ...     conventional_data=conv_df,
-    ...     alternative_datasets=alternative_datasets,
-    ...     independent_variables=['DWT', 'LOA', 'BEAM'],
-    ...     model_recommendations=selector.model_recommendations,
-    ...     analyzer_type='parametric'
-    ... )
-    >>>
-    >>> results = analyzer.analyze_all_datasets()
-    >>> analyzer.plot_multi_dataset_comparison('Main_Power')
-    >>> analyzer.plot_fuel_type_summary()
+
     """
 
     def __init__(self,
@@ -66,7 +50,13 @@ class MultiDatasetDomainAnalyzer:
                  verbose: bool = True,
                  selection_metric: str = 'rrmse',
                  selection_strategy: str = 'conservative',
-                    target_predictor_constraints: Optional[Dict[str, List[str]]] = None):
+                target_predictor_constraints: Optional[Dict[str, List[str]]] = None,
+                 build_year_col:str|None=None,
+                 year_edges:list[int]|None=None,
+                 build_eligibility:TemporalEligibility|None=None,
+                 n_matches_per_ship:int=10,
+                 caliper:float|None=None,
+                 matched_bins:dict[str, list]|None=None,):
         """
         Initialize multi-dataset analyzer.
 
@@ -115,6 +105,13 @@ class MultiDatasetDomainAnalyzer:
         self.selection_metric = selection_metric
         self.selection_strategy = selection_strategy
         self.target_predictor_constraints=target_predictor_constraints
+        self.n_matches_per_ship=n_matches_per_ship
+        self.caliper = caliper
+
+        self.build_year_col=build_year_col
+        self.year_edges=year_edges
+        self.build_eligibility=build_eligibility
+        self.matched_bins=matched_bins
 
         # Validate inputs
         self._validate_inputs()
@@ -159,7 +156,7 @@ class MultiDatasetDomainAnalyzer:
             missing = [dim for dim in all_dims if dim not in df.columns]
             if missing:
                 raise ValueError(
-                    f"Alternative dataset '{fuel_type}' missing columns: {missing}"
+                    f"Alternative dataset '{fuel_type}' missing columns: {missing} \n Available columns: {df.columns}"
                 )
 
         # Warn if fuel type names are very long (plotting issues)
@@ -587,7 +584,13 @@ class MultiDatasetDomainAnalyzer:
                 verbose=False,
                 selection_metric=self.selection_metric,
                 selection_strategy=self.selection_strategy,
-                target_predictor_constraints=self.target_predictor_constraints
+                target_predictor_constraints=self.target_predictor_constraints,
+                build_year_col=self.build_year_col,
+                year_edges=self.year_edges,
+                build_eligibility=self.build_eligibility,
+                n_matches_per_ship=self.n_matches_per_ship,
+                caliper=self.caliper,
+                matching_bins=self.matched_bins
                 # Suppress individual analyzer verbosity
             )
 
@@ -595,6 +598,7 @@ class MultiDatasetDomainAnalyzer:
                 analyser.foundation.selector = self.selector
 
             analyser.foundation.detailed_results = self.selector.detailed_results
+
 
 
             return analyser
@@ -611,7 +615,13 @@ class MultiDatasetDomainAnalyzer:
                 random_state=self.random_state,
                 selection_metric=self.selection_metric,
                 verbose=False,
-                target_predictor_constraints=self.target_predictor_constraints
+                target_predictor_constraints=self.target_predictor_constraints,
+                build_year_col=self.build_year_col,
+                year_edges=self.year_edges,
+                build_eligibility=self.build_eligibility,
+                n_matches_per_ship=self.n_matches_per_ship,
+                caliper=self.caliper,
+                matching_bins=self.matched_bins
             )
 
         else:

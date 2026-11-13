@@ -11,7 +11,7 @@ from scipy import stats
 
 from scipy.stats import anderson
 
-from config import LoggerMixin
+from config.loggermixin.logger_config import LoggerMixin
 
 
 class FleetPlottingClass(LoggerMixin):

@@ -13,7 +13,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from typing import Dict, Optional, List, Tuple
 from dataclasses import dataclass
-
+from pathlib import Path
 
 @dataclass
 class DatasetMetrics:
@@ -127,7 +127,7 @@ class DomainShiftPlotter:
 
     def plot_multiple_targets(self,
                               targets_data: Dict[str, Tuple[List[str], str, FourWayMetrics]],
-                              save_path: Optional[str] = None) -> plt.Figure:
+                              save_path: str|Path|None = None) -> plt.Figure:
         """
         Plot domain shift for multiple targets in one figure.
 
@@ -147,6 +147,11 @@ class DomainShiftPlotter:
         matplotlib.figure.Figure
             The created figure
         """
+        if isinstance(save_path,str):
+            save_path = Path(save_path)
+
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+
         n_targets = len(targets_data)
 
         if n_targets == 0:
@@ -284,7 +289,7 @@ class DomainShiftPlotter:
                                       rrmse_threshold: Optional[float] = None,
                                       threshold_label: Optional[str] = None,
                                       show_average_lines: bool = False,
-                                      save_path: Optional[str] = None) -> plt.Figure:
+                                      save_path: str|Path|None = None) -> plt.Figure:
 
         """
             Compare domain shift across multiple alternative fuel datasets.
@@ -316,6 +321,11 @@ class DomainShiftPlotter:
                 The created figure
             """
         n_datasets = len(datasets_metrics)
+
+        if isinstance(save_path,str):
+            save_path = Path(save_path)
+
+        save_path.parent.mkdir(parents=True, exist_ok=True)
 
         if n_datasets > 4:
             print(f"⚠️  Warning: {n_datasets} datasets is a lot for one plot.")

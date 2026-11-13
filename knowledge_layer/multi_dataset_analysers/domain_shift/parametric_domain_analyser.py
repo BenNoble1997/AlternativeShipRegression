@@ -13,11 +13,12 @@ import numpy as np
 from pathlib import Path
 from typing import List, Optional, Dict, Tuple
 
-from config import LoggerMixin
+from config.loggermixin.logger_config import LoggerMixin
 from knowledge_layer.multi_dataset_analysers.parametric_analysis_foundation import ParametricAnalysisFoundation
 from knowledge_layer.multi_dataset_analysers.domain_shift_plotting_class import (
     AnalysisPlotter, ResidualData, PredictionData, FourWayMetrics, DatasetMetrics
 )
+from knowledge_layer.fleet_data_class.temporal_eligibility import TemporalEligibility
 from knowledge_layer.data_split_handling_class import DataSplitHandler
 from knowledge_layer.Metrics.regression_metrics_class import RegressionMetrics
 from knowledge_layer.parametric_regression.parametric_regression_model_factory_class import ModelFactory
@@ -58,48 +59,56 @@ class ParametricDomainAnalyzer(LoggerMixin):
                  test_size: float = 0.2,
                  random_state: int = 42,
                  verbose: bool = True,
-                 selection_metric: str = 'bic',  # Default to BIC for consistency
+                 selection_metric: str = 'rrmse',  # Default to BIC for consistency
                  selection_strategy: str = 'conservative',
-             target_predictor_constraints: Optional[Dict[str, List[str]]] = None):
+             target_predictor_constraints: Optional[Dict[str, List[str]]] = None,
+                 build_year_col:str|None = None,
+                 year_edges:list=None,
+                 build_eligibility:TemporalEligibility|None=None,
+                 matching_bins:dict[str, list]=None,
+                 n_matches_per_ship=10,
+                 caliper:float|None=None):
 
         """
-        Initialize Domain Analyzer.
+    Initialize Domain Analyzer.
 
-        Parameters
-        ----------
-        conventional_data : pd.DataFrame
-            Full conventional ship dataset (will be split 80/20)
-        alternative_data : pd.DataFrame
-            Alternative fuel ships dataset
-        independent_variables : List[str]
-            List of potential predictor dimensions
-        dependent_variables : List[str], optional
-            List of target dimensions. If None, uses independent_variables.
-        model_recommendations : dict
-            Dictionary from ParametricModelSelector.model_recommendations
-            Format: {(predictor_tuple, target): model_type_string}
-            **REQUIRED for proper operation**
-        test_size : float, default=0.2
-            Fraction for train/test split of conventional data
-        random_state : int, default=42
-            Random seed for reproducibility
-        verbose : bool, default=True
-            Whether to print progress and warnings
+    Order of operations matters here: the foundation is constructed with
+    ``defer_matched_sets=True``, the conventional data is split into
+    train/test, and only then are the matched datasets built — using the
+    held-out test partition as the candidate pool. Matched-set evaluation
+    is therefore strictly out-of-sample. Matched ships may also appear in
+    the test metric; this is overlap between two evaluation views of the
+    same untrained-on population, not leakage.
 
-        selection_metric : str, default='bic'
-            Metric to use for selecting best combinations:
-            - 'adj_r2': Adjusted R² (higher is better)
-            - 'r2': R² (higher is better)
-            - 'aic': Akaike Information Criterion (lower is better)
-            - 'bic': Bayesian Information Criterion (lower is better)
-            - 'rrmse': Relative RMSE% (lower is better)
-            - 'mape': Mean Absolute Percentage Error% (lower is better)
-        selection_strategy : str, default='conservative'
-            Strategy for model selection:
-            - 'simple': Pick best by metric
-            - 'conservative': Use equivalence thresholds, prefer simpler
-            - 'nested_aware': Special handling for nested models
-        """
+    :param conventional_data: Full conventional ship dataset (split 80/20
+        internally).
+    :type conventional_data: pandas.DataFrame
+    :param alternative_data: Alternative fuel ships dataset.
+    :type alternative_data: pandas.DataFrame
+    :param independent_variables: Potential predictor dimensions.
+    :type independent_variables: list[str]
+    :param dependent_variables: Target dimensions. If ``None``, uses
+        ``independent_variables``.
+    :type dependent_variables: list[str] or None
+    :param model_recommendations: Selector output
+        ``{(predictor_tuple, target): model_type}``. Required.
+    :type model_recommendations: dict or None
+    :param test_size: Fraction of conventional data held out for testing
+        (and used as the matched-set candidate pool).
+    :type test_size: float
+    :param random_state: Random seed for reproducibility. Must be shared
+        with any sibling analyzer (e.g. Random Forest) so both use the
+        identical split and identical matched sets.
+    :type random_state: int
+    :param verbose: Whether to print progress and warnings.
+    :type verbose: bool
+    :param selection_metric: Metric for selecting best combinations.
+    :type selection_metric: str
+    :param selection_strategy: Strategy for model selection.
+    :type selection_strategy: str
+    :param target_predictor_constraints: Allowed predictors per target.
+    :type target_predictor_constraints: dict[str, list[str]] or None
+    """
         # ✅ Initialize foundation for data management
         self.foundation = ParametricAnalysisFoundation(
             conventional_data=conventional_data,
@@ -111,7 +120,14 @@ class ParametricDomainAnalyzer(LoggerMixin):
             verbose=verbose,
             selection_metric=selection_metric,
             selection_strategy=selection_strategy,
-            target_predictor_constraints=target_predictor_constraints  # ✅ NEW
+            target_predictor_constraints=target_predictor_constraints,
+            defer_matched_sets=True,
+            build_year_col=build_year_col,
+            year_edges=year_edges,
+            build_eligibility=build_eligibility,
+            n_matches_per_ship=n_matches_per_ship,
+            caliper=caliper,
+            matching_bins=matching_bins,
         )
 
         if hasattr(self, 'selector'):
@@ -128,9 +144,14 @@ class ParametricDomainAnalyzer(LoggerMixin):
         # Split conventional data into train/test
         self._split_conventional_data()
 
+        self.foundation.build_matched_sets(candidate_pool = self.conventional_test,
+                                           debug=self.verbose)
+
         # Storage
         self.results = {}
         self.results_df = None
+
+
 
     # ========================================================================
     # DELEGATE PROPERTIES
@@ -162,44 +183,47 @@ class ParametricDomainAnalyzer(LoggerMixin):
 
     def _split_conventional_data(self):
         """
-        Split conventional dataset into train/test.
+        Split the conventional dataset into train and test partitions.
 
-        Uses stratified splitting on DWT to ensure similar size distributions.
+        Uses a stratified split on DWT quintiles, implemented via positional
+        index splitting (``train_test_split`` on ``np.arange(n)`` with
+        ``stratify=pd.qcut(DWT, 5)``). This is intentionally IDENTICAL to the
+        implementation in :class:`RandomForestDomainAnalyzer`: because matched
+        conventional datasets are built from the test partition, both analyzers
+        must produce the same partition under the same ``random_state`` for the
+        parametric-vs-RF comparison to be evaluated against identical matched
+        sets. Do not change one implementation without changing the other.
+
+        Index-based splitting also avoids the failure modes of value-based
+        membership reconstruction: rows containing NaN and duplicate-valued
+        sister ships are assigned unambiguously by position.
+
+        Sets ``self.conventional_train``, ``self.conventional_test``,
+        ``self._train_indices``, and ``self._test_indices``. Original DataFrame
+        index labels are preserved by ``.iloc`` selection on a copy.
         """
-        # Get all available dimensions
-        conv_data = self.conventional_full.copy()
+        from sklearn.model_selection import train_test_split
 
-        # Create stratified split using DWT
+        conv_data = self.conventional_full.copy()
+        n = len(conv_data)
+        all_indices = np.arange(n)
+
         if 'DWT' in conv_data.columns:
             try:
-                X = conv_data.drop(columns=self.target_dimensions).values
-                y = conv_data[self.target_dimensions[0]].values  # Use first target for stratification
+                dwt_vals = conv_data['DWT'].values
+                bins = pd.qcut(dwt_vals, q=5, labels=False, duplicates='drop')
 
-                dwt_idx = list(conv_data.drop(columns=self.target_dimensions).columns).index('DWT')
-
-                X_train, X_test, _, _ = DataSplitHandler.create_stratified_train_test_split(
-                    X=X,
-                    y=y,
-                    stratify_col_index=dwt_idx,
+                train_idx, test_idx = train_test_split(
+                    all_indices,
                     test_size=self.test_size,
                     random_state=self.random_state,
-                    n_bins=5
+                    stratify=bins
                 )
 
-                # Get indices back
-                # This is a bit hacky but works
-                train_indices = []
-                test_indices = []
-
-                for i, row in enumerate(conv_data.values):
-                    row_subset = row[:X.shape[1]]
-                    if any(np.allclose(row_subset, train_row) for train_row in X_train):
-                        train_indices.append(i)
-                    else:
-                        test_indices.append(i)
-
-                self.conventional_train = conv_data.iloc[train_indices].copy()
-                self.conventional_test = conv_data.iloc[test_indices].copy()
+                self._train_indices = train_idx
+                self._test_indices = test_idx
+                self.conventional_train = conv_data.iloc[train_idx].copy()
+                self.conventional_test = conv_data.iloc[test_idx].copy()
 
             except Exception as e:
                 if self.verbose:
@@ -212,21 +236,32 @@ class ParametricDomainAnalyzer(LoggerMixin):
 
         if self.verbose:
             print(f"\nConventional data split:")
-            print(f"  Train: {len(self.conventional_train)} ships ({(1-self.test_size)*100:.0f}%)")
-            print(f"  Test:  {len(self.conventional_test)} ships ({self.test_size*100:.0f}%)")
+            print(f"  Train: {len(self.conventional_train)} ships ({(1 - self.test_size) * 100:.0f}%)")
+            print(f"  Test:  {len(self.conventional_test)} ships ({self.test_size * 100:.0f}%)")
 
     def _random_split_conventional_data(self, conv_data: pd.DataFrame):
-        """Fallback to random split if stratified fails."""
+        """
+        Fallback random split when stratification is unavailable or fails.
+
+        Mirrors the RF analyzer's fallback exactly (index-based, indices
+        stored) so both analyzers remain split-identical under a shared seed.
+
+        :param conv_data: Conventional dataset to split.
+        :type conv_data: pandas.DataFrame
+        """
         from sklearn.model_selection import train_test_split
 
-        train_df, test_df = train_test_split(
-            conv_data,
+        n = len(conv_data)
+        all_indices = np.arange(n)
+        train_idx, test_idx = train_test_split(
+            all_indices,
             test_size=self.test_size,
             random_state=self.random_state
         )
-
-        self.conventional_train = train_df.copy()
-        self.conventional_test = test_df.copy()
+        self._train_indices = train_idx
+        self._test_indices = test_idx
+        self.conventional_train = conv_data.iloc[train_idx].copy()
+        self.conventional_test = conv_data.iloc[test_idx].copy()
 
     # ========================================================================
     # MAIN ANALYSIS METHOD
@@ -330,11 +365,25 @@ class ParametricDomainAnalyzer(LoggerMixin):
                                 predictors: List[str],
                                 target: str) -> Optional[Dict]:
         """
-        Train on conventional train set, test on four datasets.
+        Train on the conventional train set and evaluate on up to four datasets.
 
-        Returns
-        -------
-        dict with comprehensive metrics including fuel-type effect isolation
+        Evaluation datasets are train, test, matched, and alternative. The
+        alternative dataset may legitimately be unavailable for a given
+        (predictors, target) combination when too few alternative-fuel ships
+        have complete data for those columns. In that case predictions are
+        skipped for the alternative set and its metrics are reported as NaN,
+        rather than failing the whole combination. This preserves the
+        conventional-side results so that combination selection (which is
+        based on conventional test performance) remains valid.
+
+        :param predictors: Predictor column names for this combination.
+        :type predictors: list[str]
+        :param target: Target column name.
+        :type target: str
+        :returns: Dictionary of comprehensive metrics including fuel-type
+            effect isolation, or ``None`` if the model could not be fitted
+            or conventional data was insufficient.
+        :rtype: dict or None
         """
 
         # ✅ Get model type from foundation
@@ -374,7 +423,7 @@ class ParametricDomainAnalyzer(LoggerMixin):
                     model_type, X_train, y_train
                 )
 
-            # Predict on all datasets (unchanged)
+            # Predict on all datasets that are actually available
             datasets_to_predict = {
                 'train': X_train,
                 'test': data_prep['X_test'],
@@ -384,6 +433,11 @@ class ParametricDomainAnalyzer(LoggerMixin):
 
             predictions = {}
             for dataset_name, X_data in datasets_to_predict.items():
+
+                if X_data is None:
+                    predictions[dataset_name] = None
+                    continue
+
                 predictions[dataset_name] = ModelFactory.predict(
                     model, preprocessor, X_data, model_type
                 )
@@ -488,7 +542,31 @@ class ParametricDomainAnalyzer(LoggerMixin):
                                    model_type: str,
                                    predictors: List[str],
                                    reference_mean:float) -> Dict:
-        """Calculate comprehensive metrics for all four datasets."""
+        """
+        Calculate comprehensive metrics for all available datasets.
+
+        Datasets whose actuals or predictions are ``None`` (typically the
+        alternative set when it has too few ships for the current predictor
+        combination) receive ``NaN`` for every metric and ``0`` for the
+        sample count. Gap metrics involving an unavailable dataset naturally
+        propagate as ``NaN``, which pandas sorting and aggregation handle
+        gracefully (NaN rows sort last and are excluded from means).
+
+        :param predictions: Mapping of dataset name to predicted values
+            (or ``None`` if that dataset was unavailable).
+        :type predictions: dict
+        :param actuals: Mapping of dataset name to true values (or ``None``).
+        :type actuals: dict
+        :param model_type: Model type string used for fitting.
+        :type model_type: str
+        :param predictors: Predictor names for this combination.
+        :type predictors: list[str]
+        :param reference_mean: Conventional-dataset target mean used to
+            normalise RRMSE for cross-dataset comparability.
+        :type reference_mean: float
+        :returns: Flat dictionary of per-dataset metrics and gap metrics.
+        :rtype: dict
+        """
         result = {
             'model_type': model_type,
             'predictors': predictors,
@@ -499,6 +577,16 @@ class ParametricDomainAnalyzer(LoggerMixin):
         for dataset_name in ['train', 'test', 'matched', 'alternative']:
             y_true = actuals[dataset_name]
             y_pred = predictions[dataset_name]
+
+            if y_true is None or y_pred is None:
+                result[f'{dataset_name}_r2'] = np.nan
+                result[f'{dataset_name}_rmse'] = np.nan
+                result[f'{dataset_name}_rrmse'] = np.nan
+                result[f'{dataset_name}_mae'] = np.nan
+                result[f'{dataset_name}_mape'] = np.nan
+                result[f'{dataset_name}_n'] = 0
+                continue
+
             metrics_calc = RegressionMetrics(y_true, y_pred)
 
             result[f'{dataset_name}_r2'] = r2_score(y_true, y_pred)
@@ -821,7 +909,24 @@ class ParametricDomainAnalyzer(LoggerMixin):
                             data_prep: Dict,
                             predictors: List[str],
                             model_type: str) -> Optional[Dict[str, np.ndarray]]:
-        """Get predictions for all four datasets."""
+        """
+        Fit the model on the training split and predict on all available datasets.
+
+        Datasets with ``None`` entries in ``data_prep`` (e.g. an alternative
+        set that was too small for this combination) are returned as ``None``
+        in the predictions dictionary rather than raising. Plotting callers
+        must check for ``None`` before rendering the corresponding panel.
+
+        :param data_prep: Output of :meth:`_prepare_fourway_data`.
+        :type data_prep: dict
+        :param predictors: Predictor names for this combination.
+        :type predictors: list[str]
+        :param model_type: Model type string used for fitting.
+        :type model_type: str
+        :returns: Mapping of dataset name to predictions (or ``None`` per
+            dataset), or ``None`` entirely if model fitting failed.
+        :rtype: dict[str, numpy.ndarray or None] or None
+        """
         X_train = data_prep['X_train']
         y_train = data_prep['y_train']
 
@@ -831,6 +936,10 @@ class ParametricDomainAnalyzer(LoggerMixin):
             predictions = {}
             for dataset_name in ['train', 'test', 'matched', 'alternative']:
                 X_data = data_prep[f'X_{dataset_name}']
+                if X_data is None:
+                    predictions[dataset_name] = None
+                    continue
+
                 predictions[dataset_name] = ModelFactory.predict(
                     model, preprocessor, X_data, model_type
                 )

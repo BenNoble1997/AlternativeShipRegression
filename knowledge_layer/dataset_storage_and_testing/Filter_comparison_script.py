@@ -203,7 +203,7 @@ def run_comparison_single(
     # STEP 1: Load data up to the point BEFORE percentile filtering
     # ------------------------------------------------------------------
     print(f"\n  Loading data from: {filepath}")
-    fleet_data = pre_processing(filepath=filepath, ship_type=ship_type.name)
+    fleet_data = pre_processing(filepath=filepath, shiptype=ship_type.name)
 
     if source_dataset not in fleet_data.processed_data:
         available = list(fleet_data.processed_data.keys())

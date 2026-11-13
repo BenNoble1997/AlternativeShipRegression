@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 
 class RegressionPerformanceMetrics:
@@ -104,6 +104,55 @@ class RegressionPerformanceMetrics:
         else:
             return (rmse / np.mean(self.y_true)) * 100
 
+    def calculate_nmae(
+        self,
+        normalisation_variable: float | None = None,
+        normalisation_type: str | None = "mean",
+    ) -> float:
+        """
+        Calculate Normalised Root Mean Squared Error (NRMSE).
+
+        NRMSE expresses the RMSE relative to the scale of the target
+        variable and returns the result in percentage.
+
+        Three normalisation options are supported:
+
+        - Custom normalisation variable
+        - Mean of target values
+        - Min-max range of target values
+
+        :param normalisation_variable: Custom value used for normalisation
+        :type normalisation_variable: float or None
+
+        :param normalisation_type: Normalisation method ("mean" or "min-max")
+        :type normalisation_type: str or None
+
+        :return: Normalised RMSE in percentage
+        :rtype: float
+
+        :note:
+            If ``normalisation_variable`` is provided,
+            it overrides ``normalisation_type``.
+
+        :note:
+            Returns NaN if target values are empty or mean equals zero.
+        """
+
+        if len(self.y_true) == 0 or np.mean(self.y_true) == 0:
+            return np.nan
+
+        mae = mean_absolute_error(self.y_true, self.y_pred)
+
+        if normalisation_variable is not None:
+            return (mae / normalisation_variable) * 100
+
+        elif normalisation_type == "min-max":
+            return (mae / (np.max(self.y_true) - np.min(self.y_true))) * 100
+
+        else:
+            return (mae / np.mean(self.y_true)) * 100
+
+
     def calculate_mape(self) -> float:
         """
         Calculate Mean Absolute Percentage Error (MAPE).
@@ -149,6 +198,17 @@ class RegressionPerformanceMetrics:
 
         return np.sum((self.y_true - self.y_pred) ** 2)
 
+    def calculate_r2(self)->float:
+
+        """
+        Calculate the r2 score of the model
+
+        Placed herefor the purposes of using a unified library
+
+        """
+        return r2_score(self.y_true, self.y_pred)
+
+
     def calculate_adj_r2(self, n_features: int) -> float:
         """
         Calculate Adjusted R-squared.
@@ -183,3 +243,49 @@ class RegressionPerformanceMetrics:
             return r2
 
         return 1 - (1 - r2) * (n - 1) / (n - n_features - 1)
+
+    def calculate_predictive_r2(self,
+                                reference_variance: float | None = None) -> float:
+        """
+        Calculate predictive R-squared (Q-squared) from out-of-fold predictions.
+
+        Defined as ``1 - PRESS / SS_tot``, where PRESS is the sum of squared
+        out-of-fold residuals and SS_tot the total sum of squares of the
+        observed values. Unlike adjusted R-squared this carries no complexity
+        penalty: the held-out predictions already exclude the in-sample
+        optimism that the penalty is designed to remove, so applying one
+        would correct for the same effect twice.
+
+        Intended to be called once per cross-validation repeat on the pooled
+        out-of-fold vector, never on an individual fold. Fold-local scoring
+        recomputes SS_tot on a handful of observations, so the result reflects
+        which samples happened to be grouped together as much as model quality.
+
+        :param reference_variance: Optional fixed variance used in place of
+            the sample variance of ``y_true`` when forming SS_tot. Supplying
+            a cohort-independent value puts Q-squared from differently sized
+            or differently spread cohorts on a common scale, mirroring the
+            role of the fixed divisor in :meth:`calculate_nrmse`.
+        :type reference_variance: float or None
+
+        :return: Predictive R-squared. Unbounded below; negative values mean
+            the model predicts held-out data worse than the cohort mean does.
+        :rtype: float
+
+        :note: Returns NaN when SS_tot is zero, which occurs if every observed
+            value is identical.
+        """
+        y_true = np.asarray(self.y_true, dtype=float)
+        y_pred = np.asarray(self.y_pred, dtype=float)
+
+        press = np.sum((y_true - y_pred) ** 2)
+
+        if reference_variance is not None:
+            ss_tot = reference_variance * len(y_true)
+        else:
+            ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
+
+        if ss_tot == 0:
+            return np.nan
+
+        return 1.0 - press / ss_tot

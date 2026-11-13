@@ -4,21 +4,20 @@ import seaborn as sns
 from pathlib import Path
 import matplotlib.pyplot as plt
 
-from alt_fuel_datasets import getting_alt_fuel_ships, get_variables
+from knowledge_layer.dataset_storage_and_testing.alt_fuel_datasets import getting_alt_fuel_ships, get_variables
 from parameters.shipshape.ShipShapeBasic_class import ShipType
 from typing import Optional, List
 
-from distribution_comparison_class import DistributionComparison
+from knowledge_layer.dataset_storage_and_testing.distribution_comparison_class import DistributionComparison
 
 from knowledge_layer.fleet_data_class.fleet_data_class import FleetData
 from knowledge_layer.dataset_storage_and_testing.sensitivity_test import matching_sensitivity_analysis,format_sensitivity_table,analyze_sensitivity_robustness
-from knowledge_layer.fleet_data_class.matched_dataset_creation import MatchedDataset
+
 from knowledge_layer.fleet_data_class.Plotting_fleet_class import FleetPlottingClass
-from LaTeX_conversion_table import export_all_tables
+
 from knowledge_layer.dataset_storage_and_testing.multi_dataset_stat_analysis import run_multi_ship_comparison
 from knowledge_layer.dataset_storage_and_testing.stat_test_debug import (
-    run_diagnostic_analysis,
-    run_multi_ship_diagnostic
+    run_diagnostic_analysis
 )
 
 from matplotlib.colors import LinearSegmentedColormap
@@ -347,7 +346,7 @@ def progressive_comparison_analysis(
         - Feature (will show "LBP (M)/DWT" format if use_ratios=True)
         - Test, Raw_p, Raw_sig, Overlap_p, Overlap_sig, Matched_p, Matched_sig
     """
-    from distribution_comparison_class import DistributionComparison
+    from knowledge_layer.dataset_storage_and_testing.distribution_comparison_class import DistributionComparison
 
     if debug:
         print("\n" + "=" * 80)
@@ -1207,12 +1206,18 @@ def plot_sensitivity_heatmap(sensitivity_df,
 
 
 
-def main(make_plots: bool = False,
+def main(
+         fuel_type_columns:list[str],
+         alt_datasets:list[str],
+         make_plots: bool = False,
          block1: bool = False,
+         min_date=1990,
+         matching_n:int=10,
          progressive_comparison: bool = False,
          matching_sensitivity: bool = False,
          multi_ship_comparison: bool = True,
-         run_diagnostics:bool=False):  # NEW PARAMETER
+         run_diagnostics:bool=False,
+         match_type:str='overlap'):  # NEW PARAMETER
 
     # Initialize all variables to None
     progressive_pure = None
@@ -1225,19 +1230,12 @@ def main(make_plots: bool = False,
     patterns_dual = None
     robust_dual = None
 
-    # # Bulk carrier filepath
-    # filepath=Path(r'C:\Users\bnoble\GitHub\ShipDesignDigitalTwin\parameters\Databases\clarksons_data\bulk_carrier')
-    # ship_type=ShipType.BULK_CARRIER
-
-    # # Ro-Pax carrier filepath
-    # filepath=Path(r'C:\Users\bnoble\GitHub\ShipDesignDigitalTwin\parameters\Databases\clarksons_data\ROPAX')
-    # ship_type=ShipType.RO_PAX
-    #
-    # Container ship filepath
-    types_list = [ShipType.BULK_CARRIER,ShipType.TANKER,ShipType.CONTAINER_SHIP,ShipType.RO_PAX]
+    types_list = [ShipType.BULK_CARRIER,ShipType.TANKER,ShipType.CONTAINER_SHIP]
 
     for ship_type in types_list:
-        bins, features, filepath, save_dir = get_variables(shiptype=ship_type)
+        bins, features,_, filepath, save_dir,data = get_variables(shiptype=ship_type)
+
+        save_dir = save_dir / Path(f"{min_date}_{matching_n}")
 
         if run_diagnostics:
             print("\n" + "=" * 80)
@@ -1257,16 +1255,32 @@ def main(make_plots: bool = False,
     # filepath=Path(r'C:\Users\bnoble\GitHub\ShipDesignDigitalTwin\parameters\Databases\clarksons_data\Tanker')
     # ship_type=ShipType.TANKER
 
-        fleet = getting_alt_fuel_ships(filepath=filepath,)
+
+        alt_fuels = ['LNG', 'Methanol','Ethanol', 'Ammonia', 'Hydrogen', 'cng', 'ethane']
+        bio_fuels = ['biofuel']
+
+        alt_fuels = {'alt_fuel': alt_fuels,
+                     'bio_fuel': bio_fuels}
+
+        conventional_fuels= ['DIESEL', 'HFO', 'MDO', 'MGO', 'IFO']
+
+
+        fleet = getting_alt_fuel_ships(filepath=filepath,
+                                       shiptype=ship_type.string,
+                                       fuel_type_columns=fuel_type_columns,
+                                       alt_fuels=alt_fuels,
+                                       conventional_fuels=conventional_fuels,
+                                       max_build_year=min_date,
+                                       outliers=False)
 
         matching_features = ['DWT', 'LBP (M)', 'BEAM (M)']
 
         if ship_type == ShipType.CONTAINER_SHIP:
             matching_features.append('TEU')
 
-        alt_datasets = ['dual_fuel','pure_alt_fuel']
+        alternative_datasets = alt_datasets
 
-        for alt_dataset in alt_datasets:
+        for alt_dataset in alternative_datasets:
 
             if make_plots:
                 create_plots(fleet=fleet,
@@ -1290,130 +1304,6 @@ def main(make_plots: bool = False,
                                                      K_S_test=False,)
 
 
-            if matching_sensitivity:
-                print("\n" + "=" * 80)
-                print("RUNNING SENSITIVITY ANALYSIS")
-                print("=" * 80)
-
-                try:
-                    # For pure alternative fuel ships
-                    sens_pure, robust_pure = sensitivity_analysis_workflow(
-                        fleet=fleet,
-                        conventional_dataset='pure_conventional',
-                        alternative_dataset=alt_dataset,
-                        ship_type=ship_type,
-                        test_features=features,
-                        matching_features=matching_features,
-                        M_W_test=True,
-                        K_S_test=False,
-                        welch_test=False
-                    )
-
-                    plot_sensitivity_heatmap(sensitivity_df=sens_pure,
-                                            matching_features=matching_features,
-                                            fuel_type='Pure_Alt_Fuel')
-                except Exception as e:
-                    print(f"ERROR in pure alt fuel sensitivity analysis: {e}")
-                    import traceback
-                    traceback.print_exc()
-
-            if progressive_comparison:
-                print("\n" + "=" * 80)
-                print("RUNNING PROGRESSIVE COMPARISON ANALYSIS")
-                print("=" * 80)
-
-                variable_name_map = {
-                    'LBP (M)': r'$L_{BP}$ (m)',
-                    'LBP (M)/DWT': r'$L_{BP}/\text{DWT}$',  # NEW: Add ratio mappings
-                    'BEAM (M)': 'Beam (m)',
-                    'BEAM (M)/DWT': r'$B/\text{DWT}$',
-                    'DRAFT (M)': 'Draft (m)',
-                    'DRAFT (M)/DWT': r'$T/\text{DWT}$',
-                    # ... etc
-                }
-
-                output_dir = r'C:\Users\bnoble\GitHub\ShipDesignDigitalTwin\knowledge_layer\results\experiment0'
-
-                # Run ABSOLUTE value analysis
-                print("\n" + "-" * 80)
-                print("ABSOLUTE VALUE ANALYSIS")
-                print("-" * 80)
-                absolute_results = run_progressive_for_all_datasets(
-                    fleet=fleet,
-                    ship_type=ship_type,
-                    test_features=features,
-                    matching_parameter='DWT',
-                    output_dir=output_dir,
-                    variable_name_map=variable_name_map,
-                    print_results=True,
-                    use_ratios=False,  # Absolute values
-                    debug=False
-                )
-
-                # Run RATIO analysis
-                print("\n" + "-" * 80)
-                print("RATIO ANALYSIS")
-                print("-" * 80)
-                ratio_results = run_progressive_for_all_datasets(
-                    fleet=fleet,
-                    ship_type=ship_type,
-                    test_features=features,
-                    matching_parameter='DWT',
-                    output_dir=output_dir,
-                    variable_name_map=variable_name_map,
-                    print_results=True,
-                    use_ratios=True,  # Test ratios
-                    debug=True  # Enable debugging for first run
-                )
-
-
-        # ONLY export tables if we have data to export
-        # Check for pure alt fuel results
-        if any([progressive_pure is not None, sens_pure is not None,
-                patterns_pure is not None, robust_pure is not None]):
-            print("\n" + "=" * 80)
-            print("EXPORTING PURE ALT FUEL TABLES")
-            print("=" * 80)
-            try:
-                export_all_tables(
-                    progressive_df=progressive_pure,
-                    sensitivity_df=sens_pure,
-                    pattern_df=patterns_pure,
-                    robustness_df=robust_pure,
-                    matching_features=matching_features,
-                    output_dir=f"latex_tables_{ship_type.name}_pure_alt",
-                    prefix=f"{alt_datasets}_fuel_{ship_type.name}"
-                )
-            except Exception as e:
-                print(f"ERROR exporting pure alt fuel tables: {e}")
-                import traceback
-                traceback.print_exc()
-
-        # Check for dual fuel results
-        if any([progressive_dual is not None, sens_dual is not None,
-                patterns_dual is not None, robust_dual is not None]):
-            print("\n" + "=" * 80)
-            print("EXPORTING DUAL FUEL TABLES")
-            print("=" * 80)
-            try:
-                export_all_tables(
-                    progressive_df=progressive_dual,
-                    sensitivity_df=sens_dual,
-                    pattern_df=patterns_dual,
-                    robustness_df=robust_dual,
-                    matching_features=matching_features,
-                    output_dir=f"latex_tables_{ship_type.name}_dual",
-                    prefix=f"dual_fuel_{ship_type.name}"
-                )
-            except Exception as e:
-                print(f"ERROR exporting dual fuel tables: {e}")
-                import traceback
-                traceback.print_exc()
-
-        print("\n" + "=" * 80)
-        print("ANALYSIS COMPLETE")
-        print("=" * 80)
-
         if multi_ship_comparison:
             print("\n" + "=" * 80)
             print("RUNNING MULTI-SHIP TYPE COMPARISON")
@@ -1427,34 +1317,71 @@ def main(make_plots: bool = False,
                 ShipType.RO_PAX
             ]
 
-            output_dir=r'C:\Users\bnoble\GitHub\ShipDesignDigitalTwin\knowledge_layer\results\experiment0'
+            experiment_0_dir = Path(r"C:\Users\bnoble\GitHub\ShipDesignDigitalTwin\knowledge_layer\results\new\experiment0\sister_ships_refined2")
+
+            if match_type is 'matched':
+                string = f'{matching_n}'
+            else:
+                string = match_type
+
+            extension = Path(f"{min_date}_with_{string}_matching")
+
+            save_path = experiment_0_dir / extension
 
             variable_name_map = {'LOA (M)':'$L_{OA} (m)$',
                                  'LBP (M)':'$L_{BP} (m)$',
                                  'BEAM (M)':'Beam (m)',
                                  'DRAFT (M)':'Draft (m)',
                                  'DEPTH (M)':'Depth (m)',
-                                 'DWT':'DWT (t)'}
+                                 'DWT':'DWT (t)',
+                                 'MCR (KW)':'$P_{MCR} (kW)$',}
 
             results = run_multi_ship_comparison(
                 ship_types=ship_types_to_compare,
                 get_variables_func=get_variables,
                 getting_alt_fuel_ships_func=getting_alt_fuel_ships,
-                output_dir=output_dir,
+                alternative_datasets=alternative_datasets,
+                max_build_year=min_date,
+                alt_fuels=alt_fuels,
+                fuel_type_columns=fuel_type_columns,
+                conventional_fuels=conventional_fuels,
+                output_dir=save_path,
                 variable_name_map=variable_name_map,
                 matching_parameter='DWT',
-                n_matches_per_ship=10,
+                n_matches_per_ship=matching_n,
                 use_ratios=False,
-                conventional_type='overlap',
-                bootstrap=False
+                conventional_type=match_type,
+                bootstrap=True
             )
 
 
 
 if __name__ == '__main__':
-    main(make_plots=False,
-         block1=False,
-         matching_sensitivity=False,
-         progressive_comparison=False,
-         multi_ship_comparison=True,
-         run_diagnostics=False)
+
+
+    fuel_type_columns = ['MAIN_FUEL', 'AUX_FUEL', "BUNKER_FUEL"]
+    alt_fuels = ['LNG', 'Methanol', 'Ethanol', 'Ammonia', 'Hydrogen', 'cng', 'ethane']
+    bio_fuels = ['biofuel']
+
+    alt_fuels = {'Alternative fuel': alt_fuels,
+                 'Bio fuels': bio_fuels}
+
+    conventional_fuels = ['DIESEL', 'HFO', 'MDO', 'MGO', 'IFO']
+
+    alt_datasets = ["dual_fuel_LNG", "dual_fuel_Methanol"]
+
+    # years = [1990,2000]
+    years = [1990]
+
+    for year in years:
+
+        main(fuel_type_columns=fuel_type_columns,
+            make_plots=False,
+             block1=False,
+             matching_sensitivity=False,
+             progressive_comparison=False,
+             multi_ship_comparison=True,
+             run_diagnostics=False,
+             alt_datasets=alt_datasets,
+             match_type='full',
+             min_date=year)

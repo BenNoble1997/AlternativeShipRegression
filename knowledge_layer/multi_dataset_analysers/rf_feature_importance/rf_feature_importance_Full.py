@@ -26,16 +26,20 @@ Workflow:
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Sequence, Any
 import warnings
 import math
+from pathlib import Path
 
 from sklearn.ensemble import RandomForestRegressor
 from knowledge_layer.Metrics.regression_metrics_class import RegressionMetrics
 from knowledge_layer.variable_combination_manager_class import VariableCombinationManager
 from knowledge_layer.fleet_data_class.matched_dataset_creation import MatchedDataset
-from config import LoggerMixin
-
+from knowledge_layer.fleet_data_class.temporal_eligibility import TemporalEligibility
+from config.loggermixin.logger_config import LoggerMixin
+from knowledge_layer.multi_dataset_analysers.rf_feature_importance.feature_order_resolver import FeatureOrderResolver
+from knowledge_layer.multi_dataset_analysers.rf_feature_importance.heat_map_colouring import ImportanceColorScale, HeatmapPanelResult
+from knowledge_layer.multi_dataset_analysers.rf_feature_importance.panel_importance_summary import PanelImportanceSummary, ImportanceSummaryTableBuilder
 
 warnings.filterwarnings('ignore')
 
@@ -64,7 +68,11 @@ class RFFullFeatureImportanceAnalyzer(LoggerMixin):
                  forbidden_combinations: Optional[List[Tuple[str, ...]]] = None,
                  rf_params: Optional[Dict] = None,
                  calculate_permutation_importance: bool = False,
-                 verbose: bool = True):
+                 verbose: bool = True,
+                 build_year_col:str|None = None,
+                 year_edges:list=None,
+                 build_eligibility:TemporalEligibility|None=None,
+                 matching_bins:dict=None,):
         """
         Initialize Full Feature Importance Analyzer.
 
@@ -101,12 +109,20 @@ class RFFullFeatureImportanceAnalyzer(LoggerMixin):
             fixed_dimensions=[],  # No fixed dimensions for full feature analysis
             relationship_context=relationship_context,
             forbidden_combinations=forbidden_combinations,
-            verbose=verbose
+            verbose=verbose,
+
         )
 
-        # Store datasets
-        self.conventional_full = conventional_data[self.combination_manager.available_dimensions].copy()
-        self.alternative = alternative_data[self.combination_manager.available_dimensions].copy()
+        self.build_year_col = build_year_col
+        self.year_edges = year_edges
+        self.build_eligibility = build_eligibility
+        self.matching_bins = matching_bins
+        self.available_dimensions = variable_dimensions
+
+
+
+        self.conventional_full = self._resolve_data_variables("conventional", conventional_data.copy())
+        self.alternative = self._resolve_data_variables("alternative", alternative_data.copy())
 
         # Default RF parameters (tuned for many features)
         self.rf_params = rf_params or {
@@ -145,6 +161,54 @@ class RFFullFeatureImportanceAnalyzer(LoggerMixin):
                   f"max_depth={self.rf_params.get('max_depth', 15)}, "
                   f"max_features={self.rf_params.get('max_features', 'sqrt')}")
             print(f"  Permutation test:          {'Enabled (slower)' if calculate_permutation_importance else 'Disabled (faster)'}")
+
+    def _resolve_data_variables(self, name, data):
+        """
+        resolve which variables should be extracted and used in the datasets.
+
+
+        :return:
+        """
+
+        retained = list(self.available_dimensions)
+
+        if self.build_year_col is not None:
+
+            if self.build_year_col not in data.columns:
+                raise KeyError(
+                    f"build_year_col '{self.build_year_col}' is not a column of the "
+                    f"{name} dataset, so build-year blocking cannot be applied."
+                )
+            retained.append(self.build_year_col)
+
+        if self.build_eligibility is not None:
+
+            if self.build_eligibility.anchor_column not in data.columns:
+                raise KeyError(
+                    f"build_year_col '{self.build_eligibility.anchor_column}' is not a column of the "
+                    f"{name} dataset, so build-year blocking cannot be applied."
+                )
+            retained.append(self.build_eligibility.anchor_column)
+
+        if self.matching_bins is not None:
+
+            if isinstance(self.matching_bins, list):
+                columns = self.matching_bins
+            else:
+                columns = self.matching_bins.keys()
+
+            for column in columns:
+                if column not in data.columns:
+                    raise KeyError(
+                            f"build_year_col '{column}' is not a column of the "
+                            f"{name} dataset, so build-year blocking cannot be applied."
+                        )
+                retained.append(column)
+
+        result = data[list(set(retained))].copy()
+
+
+        return result
 
     def _validate_data_quality(self):
         """Check data quality and warn about issues."""
@@ -308,13 +372,13 @@ class RFFullFeatureImportanceAnalyzer(LoggerMixin):
         # R² filtering
         if min_r2 is not None:
             if dataset == 'alternative':
-                r2_mask = results_df['alt_r2'] >= min_r2
+                r2_mask = results_df['oob_alt'] >= min_r2
                 filtering_applied.append(f"alt_r2 >= {min_r2:.3f}")
             elif dataset == 'conventional_full':
-                r2_mask = results_df['conv_full_r2'] >= min_r2
+                r2_mask = results_df['oob_full'] >= min_r2
                 filtering_applied.append(f"conv_full_r2 >= {min_r2:.3f}")
             elif dataset == 'conventional_matched':
-                r2_mask = results_df['conv_matched_r2'] >= min_r2
+                r2_mask = results_df['oob_matched'] >= min_r2
                 filtering_applied.append(f"conv_matched_r2 >= {min_r2:.3f}")
             elif dataset == 'all':
                 r2_mask = (
@@ -568,13 +632,48 @@ class RFFullFeatureImportanceAnalyzer(LoggerMixin):
                 print(f"  Creating matched dataset for {len(predictors)} predictors...")
 
             try:
-                matched_dict = MatchedDataset.multiple_matched_datasets(
-                    alternative_fleet=self.alternative,
-                    conventional_fleet=self.conventional_full,
-                    logger=self.logger,
-                    predictor_groups=[predictors],
-                    std_reference='conventional'
-                )
+
+                if self.build_eligibility is not None:
+                    matched_dict = MatchedDataset.multiple_matched_datasets(
+                        alternative_fleet=self.alternative,
+                        conventional_fleet=self.conventional_full,
+                        logger=self.logger,
+                        predictor_groups=[predictors],
+                        std_reference='conventional',
+                        eligibility=self.build_eligibility,
+                        binning_features=self.matching_bins,
+                        n_matches_per_ship = 5
+                    )
+
+
+                elif self.build_year_col is not None:
+                    alt_data,conv_data = MatchedDataset.add_build_year_window(alternative_fleet=self.alternative,
+                                                                              conventional_fleet=self.conventional_full,
+                                                                              year_column=self.build_year_col,
+                                                                              edges=self.year_edges,
+                                                                              )
+
+                    matched_dict = MatchedDataset.multiple_matched_datasets(
+                        alternative_fleet=alt_data,
+                        conventional_fleet=conv_data,
+                        logger=self.logger,
+                        predictor_groups=[predictors],
+                        std_reference='conventional',
+                        binning_features=['BUILD_YEAR_WINDOW'],
+                        n_matches_per_ship = 5
+                    )
+
+                else:
+
+                    matched_dict = MatchedDataset.multiple_matched_datasets(
+                        alternative_fleet=self.alternative,
+                        conventional_fleet=self.conventional_full,
+                        logger=self.logger,
+                        predictor_groups=[predictors],
+                        std_reference='conventional',
+                        binning_features=self.matching_bins,
+                        n_matches_per_ship = 5
+                    )
 
                 if predictor_key in matched_dict:
                     self.matched_datasets[predictor_key] = matched_dict[predictor_key]
@@ -1302,8 +1401,8 @@ class RFFullFeatureImportanceAnalyzer(LoggerMixin):
         # Summary statistics
         switched_total = (results_df['top_full'] != results_df['top_alternative']).sum()
         avg_features = results_df['n_predictors'].mean()
-        avg_r2_full = results_df['conv_full_r2'].mean()
-        avg_r2_alt = results_df['alt_r2'].mean()
+        avg_r2_full = results_df['oob_full'].mean()
+        avg_r2_alt = results_df['oob_alt'].mean()
 
         print(f"\n  Top feature changes (Full → Alt): {switched_total}/{len(results_df)}")
         print(f"  Average predictors per target:    {avg_features:.1f}")
@@ -1739,6 +1838,16 @@ class RFFullFeatureImportanceAnalyzer(LoggerMixin):
                                 alternative_dataset_name: str = 'Alternative',
                                 n_cols: int = 3,
                                 debug: bool = False,
+                                # ── feature ordering ──────────────────────────
+                                feature_order: str = 'mean',
+                                feature_order_scope: str = 'global',
+                                explicit_feature_order: Optional[Sequence[str]] = None,
+                                # ── colour scale ──────────────────────────────
+                                color_scale: str = 'figure',
+                                color_scale_vmax: Optional[float] = None,
+                                color_scale_percentile: float = 95.0,
+                                color_scale_round_to: Optional[float] = 0.05,
+                                shared_colorbar: bool = True,
                                 # ── text ──────────────────────────────────────
                                 base_font_size: int = 11,
                                 tick_font_size: Optional[int] = None,
@@ -1757,14 +1866,27 @@ class RFFullFeatureImportanceAnalyzer(LoggerMixin):
         When ``separate_figures=False`` all targets are tiled into a single
         figure whose grid is controlled by ``n_cols``.
 
+        Two presentation policies are resolved once, before any drawing, and
+        shared by every panel:
+
+        - Row order, via :class:`FeatureOrderResolver`, which separates *which*
+          features are shown (``top_n``, magnitude-driven) from *where* they
+          are shown (``feature_order``).
+        - Colour bounds, via :class:`ImportanceColorScale`. With a shared
+          scale, a given hue denotes the same importance in every panel, so
+          panels become visually comparable; without it, colour encodes only
+          rank within its own panel.
+
         :param target: Specific target to plot. If ``None``, plots all retained
             targets.
         :type target: str, optional
         :param separate_figures: If ``True`` each target gets its own figure;
-            otherwise all targets share a single tiled figure.
+            otherwise all targets share a single tiled figure. A shared colour
+            scale still spans all figures, so the separate files remain
+            mutually comparable.
         :type separate_figures: bool
-        :param top_n: Maximum number of features (rows) to display per heatmap,
-            ranked by conventional-full importance. ``None`` shows all features.
+        :param top_n: Maximum number of features (rows) to display per heatmap.
+            ``None`` shows all features.
         :type top_n: int, optional
         :param min_r2: Minimum R² threshold for retaining a target.
         :type min_r2: float, optional
@@ -1783,7 +1905,10 @@ class RFFullFeatureImportanceAnalyzer(LoggerMixin):
         :type title_suffix: str
         :param cmap: Matplotlib colormap name.
         :type cmap: str
-        :param annotate: If ``True``, importance values are printed inside cells.
+        :param annotate: If ``True``, importance values are printed inside
+            cells. Strongly recommended alongside a clipping colour scale,
+            since annotated cells retain their exact value where colour
+            saturates.
         :type annotate: bool
         :param annotation_format: Python format string for cell annotations.
         :type annotation_format: str
@@ -1796,35 +1921,60 @@ class RFFullFeatureImportanceAnalyzer(LoggerMixin):
         :param n_cols: Number of columns in the tiled figure. Clamped to the
             number of retained targets.
         :type n_cols: int
-        :param debug: Print intermediate counts and filtering decisions.
+        :param debug: Print intermediate counts, filtering decisions, the
+            resolved feature ordering, and the resolved colour bounds.
         :type debug: bool
-        :param base_font_size: Base font size in points. Axis labels, subplot
-            titles, colorbar labels, and the info text box all scale relative
-            to this. Typical range 9–13.
+        :param feature_order: Row-ordering strategy. ``'mean'`` (default) ranks
+            by cross-dataset mean importance; ``'conventional_full'``
+            reproduces the legacy ranking. See :class:`FeatureOrderResolver`.
+        :type feature_order: str
+        :param feature_order_scope: ``'global'`` (default) or ``'panel'``.
+        :type feature_order_scope: str
+        :param explicit_feature_order: Canonical feature sequence, required
+            when ``feature_order='explicit'``.
+        :type explicit_feature_order: collections.abc.Sequence[str], optional
+        :param color_scale: Colour-bound strategy. ``'figure'`` (default)
+            anchors to the largest importance drawn; ``'spread'`` anchors to
+            the largest cross-dataset difference, maximising the visibility of
+            cohort shifts; ``'percentile'`` clips the dominant tail;
+            ``'fixed'`` uses ``color_scale_vmax``; ``'panel'`` reproduces the
+            legacy per-subplot scaling. See :class:`ImportanceColorScale`.
+        :type color_scale: str
+        :param color_scale_vmax: Explicit upper bound, required when
+            ``color_scale='fixed'``.
+        :type color_scale_vmax: float, optional
+        :param color_scale_percentile: Percentile used when
+            ``color_scale='percentile'``.
+        :type color_scale_percentile: float
+        :param color_scale_round_to: Round the bound up to this multiple, for
+            a readable colorbar. ``None`` disables rounding.
+        :type color_scale_round_to: float, optional
+        :param shared_colorbar: When the scale is shared and multiple panels
+            are tiled, draw one figure-level colorbar instead of one per
+            panel. Ignored under ``color_scale='panel'``.
+        :type shared_colorbar: bool
+        :param base_font_size: Base font size in points; other sizes scale
+            relative to this. Typical range 9–13.
         :type base_font_size: int
-        :param tick_font_size: Font size for axis tick labels (feature names on
-            the y-axis, dataset names on the x-axis). When ``None``, defaults
-            to ``base_font_size - 1``. Set explicitly to make ticks larger or
-            smaller than the rest of the text.
+        :param tick_font_size: Font size for axis tick labels. When ``None``,
+            defaults to ``base_font_size - 1``.
         :type tick_font_size: int, optional
-        :param annotation_font_size: Font size for the numeric values printed
-            inside heatmap cells. When ``None``, defaults to
-            ``base_font_size - 1``. Set explicitly to increase readability on
-            small figures.
+        :param annotation_font_size: Font size for in-cell values. When
+            ``None``, defaults to ``base_font_size - 1``.
         :type annotation_font_size: int, optional
-        :param suptitle_font_size: Font size for the figure-level suptitle (the
-            bold main title across all panels). When ``None``, defaults to
-            ``base_font_size + 4``.
+        :param suptitle_font_size: Font size for the figure suptitle. When
+            ``None``, defaults to ``base_font_size + 4``.
         :type suptitle_font_size: int, optional
-        :param gridspec_top: Upper boundary of the subplot area as a fraction of
-            figure height (0–1). Controls the gap between the suptitle and the
-            first row of panels. When ``None``, it is derived automatically from
-            the number of title lines. Typical range 0.88–0.96.
+        :param gridspec_top: Upper boundary of the subplot area as a fraction
+            of figure height (0–1). When ``None``, derived from the number of
+            title lines. Typical range 0.88–0.96.
         :type gridspec_top: float, optional
         :returns: A single ``Figure`` when ``separate_figures=False``, or a
             ``list`` of figures when ``separate_figures=True``. ``None`` if no
             targets pass filtering.
         :rtype: matplotlib.figure.Figure or list[matplotlib.figure.Figure] or None
+        :raises ValueError: If any ordering or colour-scale option is
+            unrecognised or internally inconsistent.
         """
 
         if self.comparison_results is None or len(self.comparison_results) == 0:
@@ -1849,6 +1999,8 @@ class RFFullFeatureImportanceAnalyzer(LoggerMixin):
         if debug:
             print(f"   Font sizes: {fs}")
             print(f"   figsize={figsize}, n_cols={n_cols}, gridspec_top={gridspec_top}")
+            print(f"   feature_order={feature_order!r}, scope={feature_order_scope!r}")
+            print(f"   color_scale={color_scale!r}, shared_colorbar={shared_colorbar}")
 
         results_df = self._filter_results_by_performance(
             results_df=self.comparison_results,
@@ -1871,6 +2023,30 @@ class RFFullFeatureImportanceAnalyzer(LoggerMixin):
                 print(f"No results found for target '{target}'")
                 return None
 
+        # ── establish presentation policies once, before any drawing ────────
+        order_resolver = FeatureOrderResolver(
+            strategy=feature_order,
+            scope=feature_order_scope,
+            explicit_order=explicit_feature_order,
+            debug=debug,
+        )
+        order_resolver.freeze(row for _, row in results_df.iterrows())
+
+        # Colour scale must be frozen *after* ordering, since the drawn cell
+        # set depends on the ordering and the top_n cut.
+        color_scale_resolver = ImportanceColorScale(
+            strategy=color_scale,
+            fixed_vmax=color_scale_vmax,
+            percentile=color_scale_percentile,
+            round_to=color_scale_round_to,
+            debug=debug,
+        )
+        color_scale_resolver.freeze(
+            rows=(row for _, row in results_df.iterrows()),
+            order_resolver=order_resolver,
+            top_n=top_n,
+        )
+
         if separate_figures:
             figures = []
             for _, row in results_df.iterrows():
@@ -1889,6 +2065,9 @@ class RFFullFeatureImportanceAnalyzer(LoggerMixin):
                     alternative_dataset_name=alternative_dataset_name,
                     fs=fs,
                     gridspec_top=gridspec_top,
+                    order_resolver=order_resolver,
+                    color_scale_resolver=color_scale_resolver,
+                    debug=debug,
                 )
                 figures.append(fig)
 
@@ -1914,7 +2093,19 @@ class RFFullFeatureImportanceAnalyzer(LoggerMixin):
 
             fig = plt.figure(figsize=(figsize[0] * effective_n_cols,
                                       figsize[1] * n_rows),
-                 layout='constrained')
+                             layout='constrained')
+
+            # A single figure-level colorbar is only meaningful when every
+            # panel shares one scale.
+            use_figure_colorbar = (
+                shared_colorbar
+                and color_scale_resolver.is_shared
+                and n_targets > 1
+            )
+
+            if debug:
+                print(f"   Colorbar mode: "
+                      f"{'figure-level (shared)' if use_figure_colorbar else 'per-panel'}")
 
             # Build hierarchical title
             main_title = 'Feature Importance Comparison - Heatmap View'
@@ -1926,6 +2117,11 @@ class RFFullFeatureImportanceAnalyzer(LoggerMixin):
                 metadata['Min R²'] = f'{min_r2:.2f} ({filter_dataset})'
             if len(results_df) < len(self.comparison_results):
                 metadata['Targets shown'] = f'{len(results_df)}/{len(self.comparison_results)}'
+            if color_scale_resolver.is_shared:
+                scale_note = f'0–{color_scale_resolver.vmax:.2f} ({color_scale})'
+                if color_scale_resolver.clips:
+                    scale_note += ', clipped'
+                metadata['Colour scale'] = scale_note
 
             title_structure = self._build_hierarchical_title(
                 main_title=main_title,
@@ -1943,9 +2139,13 @@ class RFFullFeatureImportanceAnalyzer(LoggerMixin):
             auto_top = {1: 0.97, 2: 0.95, 3: 0.93}.get(n_lines, 0.91)
             effective_top = gridspec_top if gridspec_top is not None else auto_top
 
+            panel_axes = []
+            last_mappable = None
+
             for idx, (_, row) in enumerate(results_df.iterrows()):
                 ax = fig.add_subplot(n_rows, effective_n_cols, idx + 1)
-                self._plot_heatmap_on_axis(
+                panel_axes.append(ax)
+                panel = self._plot_heatmap_on_axis(
                     ax=ax,
                     row=row,
                     top_n=top_n,
@@ -1955,16 +2155,38 @@ class RFFullFeatureImportanceAnalyzer(LoggerMixin):
                     variable_name_map=variable_name_map,
                     alternative_dataset_name=alternative_dataset_name,
                     fs=fs,
+                    order_resolver=order_resolver,
+                    color_scale_resolver=color_scale_resolver,
+                    draw_colorbar=not use_figure_colorbar,
+                    debug=debug,
                 )
+                last_mappable = panel.mappable
 
             total_cells = n_rows * effective_n_cols
             for empty_idx in range(n_targets + 1, total_cells + 1):
                 ax = fig.add_subplot(n_rows, effective_n_cols, empty_idx)
                 ax.set_visible(False)
 
+            # ── one colorbar for the whole figure ───────────────────────────
+            if use_figure_colorbar and last_mappable is not None:
+                cbar = fig.colorbar(
+                    last_mappable,
+                    ax=panel_axes,
+                    fraction=0.025,
+                    pad=0.02,
+                    extend=color_scale_resolver.extend,
+                )
+                cbar.set_label('Feature Importance', rotation=270, labelpad=20,
+                               fontsize=fs['colorbar_label'])
+                cbar.ax.tick_params(labelsize=fs['tick'])
+
             fig.get_layout_engine().set(rect=[0, 0, 1, effective_top])
 
             if save_path:
+
+                if isinstance(save_path, str):
+                    save_path = Path(save_path)
+                save_path.parent.mkdir(parents=True, exist_ok=True)
                 fig.savefig(save_path, dpi=300, bbox_inches='tight')
                 if self.verbose:
                     print(f"✅ Combined heatmap saved to {save_path}")
@@ -2092,24 +2314,38 @@ class RFFullFeatureImportanceAnalyzer(LoggerMixin):
                                variable_name_map: Optional[Dict[str, str]],
                                alternative_dataset_name: str,
                                fs: Dict,
-                               gridspec_top: Optional[float] = None):
+                               gridspec_top: Optional[float] = None,
+                               order_resolver: Optional['FeatureOrderResolver'] = None,
+                               color_scale_resolver: Optional['ImportanceColorScale'] = None,
+                               debug: bool = False):
         """
         Create a single heatmap figure for one target dimension.
 
-        Accepts a pre-computed font-size dict ``fs`` and an optional
-        ``gridspec_top`` override so all sizing decisions flow from the
-        public method rather than being re-derived here.
+        Accepts a pre-computed font-size dict ``fs``, an optional
+        ``gridspec_top`` override, and the shared ordering and colour-scale
+        resolvers, so every sizing, ordering and colour decision flows from the
+        public method rather than being re-derived here. Because the resolvers
+        are shared across calls, separately generated figures remain mutually
+        comparable.
 
         :param fs: Font-size mapping produced in :meth:`plot_importance_heatmap`.
         :type fs: dict
         :param gridspec_top: Explicit top-margin override (0–1). When ``None``,
             derived automatically from the number of title lines.
         :type gridspec_top: float, optional
+        :param order_resolver: Shared row-ordering policy. When ``None``, the
+            axis plotter falls back to legacy conventional-full ranking.
+        :type order_resolver: FeatureOrderResolver, optional
+        :param color_scale_resolver: Shared colour-bound policy. When ``None``,
+            the axis plotter falls back to per-panel scaling.
+        :type color_scale_resolver: ImportanceColorScale, optional
+        :param debug: Forward stage diagnostics to the axis plotter.
+        :type debug: bool
         """
 
         fig, ax = plt.subplots(figsize=figsize)
 
-        self._plot_heatmap_on_axis(
+        panel = self._plot_heatmap_on_axis(
             ax=ax,
             row=row,
             top_n=top_n,
@@ -2119,14 +2355,17 @@ class RFFullFeatureImportanceAnalyzer(LoggerMixin):
             variable_name_map=variable_name_map,
             alternative_dataset_name=alternative_dataset_name,
             fs=fs,
+            order_resolver=order_resolver,
+            color_scale_resolver=color_scale_resolver,
+            draw_colorbar=True,
+            debug=debug,
         )
 
         # Build hierarchical title
         target_display = self._apply_name_mapping([row['target']], variable_name_map)[0]
         main_title = target_display
         if top_n is not None:
-            n_shown = len(list(row['importance_conventional_full'].keys())[:top_n])
-            main_title += f' (Top {n_shown} Features)'
+            main_title += f' (Top {len(panel.features)} Features)'
 
         metadata = {}
         if min_r2 is not None:
@@ -2136,6 +2375,11 @@ class RFFullFeatureImportanceAnalyzer(LoggerMixin):
             f"{row['conv_matched_r2']:.3f} / "
             f"{row['alt_r2']:.3f}"
         )
+        if color_scale_resolver is not None and color_scale_resolver.is_shared:
+            metadata['Colour scale'] = (
+                f'0–{color_scale_resolver.vmax:.2f} '
+                f'({color_scale_resolver.strategy})'
+            )
 
         title_structure = self._build_hierarchical_title(
             main_title=main_title,
@@ -2166,18 +2410,46 @@ class RFFullFeatureImportanceAnalyzer(LoggerMixin):
                               annotation_format: str,
                               variable_name_map: Optional[Dict[str, str]] = None,
                               alternative_dataset_name: str = 'Alternative',
-                              fs: Optional[Dict] = None):
+                              fs: Optional[Dict] = None,
+                              order_resolver: Optional['FeatureOrderResolver'] = None,
+                              color_scale_resolver: Optional['ImportanceColorScale'] = None,
+                              draw_colorbar: bool = True,
+                              debug: bool = False) -> 'HeatmapPanelResult':
         """
         Plot heatmap on given axis for a single target.
 
-        All font sizes are read from ``fs`` if provided, otherwise sensible
-        hardcoded defaults are used so the method remains callable without
-        the public-method wrapper (e.g. in tests).
+        Row order and colour bounds are obtained from the supplied resolvers
+        rather than derived locally, so every panel in a figure shares one
+        policy for each. When a resolver is omitted the method falls back to
+        the legacy behaviour (conventional-full ranking, per-panel ``vmax``),
+        keeping it callable standalone (e.g. in tests).
+
+        The annotation contrast threshold is taken from the applied ``vmax``,
+        not the panel maximum. Under a shared scale these differ, and using
+        the panel maximum would place dark text on dark cells in any panel
+        whose values are uniformly small.
+
+        Missing per-dataset entries are treated as zero importance rather than
+        raising, since a feature may be present in one cohort's importance
+        dict and absent from another's.
 
         :param fs: Font-size mapping with keys ``'tick'``, ``'annotation'``,
             ``'axis_label'``, ``'subplot_title'``, ``'colorbar_label'``,
             ``'infobox'``. Produced by :meth:`plot_importance_heatmap`.
         :type fs: dict, optional
+        :param order_resolver: Shared row-ordering policy.
+        :type order_resolver: FeatureOrderResolver, optional
+        :param color_scale_resolver: Shared colour-bound policy.
+        :type color_scale_resolver: ImportanceColorScale, optional
+        :param draw_colorbar: Draw a colorbar attached to this axis. Set
+            ``False`` when the caller draws one figure-level colorbar instead.
+        :type draw_colorbar: bool
+        :param debug: Print the resolved feature order, colour bound, and
+            clipping count for this panel.
+        :type debug: bool
+        :returns: The features drawn, the ``imshow`` mappable, and the applied
+            ``vmax``.
+        :rtype: HeatmapPanelResult
         """
 
         # Fall back to hardcoded defaults if called without fs
@@ -2192,37 +2464,61 @@ class RFFullFeatureImportanceAnalyzer(LoggerMixin):
             }
 
         # ── data preparation ────────────────────────────────────────────────
-        conv_full_imp = row['importance_conventional_full']
-        conv_matched_imp = row['importance_conventional_matched']
-        alt_imp = row['importance_alternative']
+        conv_full_imp = row['importance_conventional_full'] or {}
+        conv_matched_imp = row['importance_conventional_matched'] or {}
+        alt_imp = row['importance_alternative'] or {}
 
-        sorted_features = sorted(conv_full_imp.items(), key=lambda x: x[1], reverse=True)
-        if top_n is not None:
-            sorted_features = sorted_features[:top_n]
+        if order_resolver is not None:
+            features = order_resolver.order_for(row, top_n=top_n)
+        else:
+            legacy = sorted(conv_full_imp.items(), key=lambda x: x[1], reverse=True)
+            if top_n is not None:
+                legacy = legacy[:top_n]
+            features = [f[0] for f in legacy]
 
-        features = [f[0] for f in sorted_features]
+        if debug:
+            print(f"   [heatmap] target={row['target']!r} row order: {features}")
+
         features_display = self._apply_name_mapping(features, variable_name_map)
 
         dataset_names_short = ['Conv. (Full)', 'Conv. (Matched)', alternative_dataset_name]
         importance_matrix = np.zeros((len(features), 3))
         for i, feature in enumerate(features):
-            importance_matrix[i, 0] = conv_full_imp[feature]
-            importance_matrix[i, 1] = conv_matched_imp[feature]
-            importance_matrix[i, 2] = alt_imp[feature]
+            importance_matrix[i, 0] = float(conv_full_imp.get(feature, 0.0))
+            importance_matrix[i, 1] = float(conv_matched_imp.get(feature, 0.0))
+            importance_matrix[i, 2] = float(alt_imp.get(feature, 0.0))
+
+        # ── colour bounds ───────────────────────────────────────────────────
+        if color_scale_resolver is not None:
+            vmax = color_scale_resolver.vmax_for(importance_matrix)
+            extend = color_scale_resolver.extend
+        else:
+            vmax = float(importance_matrix.max()) if importance_matrix.size else 1e-6
+            extend = 'neither'
+
+        if debug:
+            n_clipped = int(np.sum(importance_matrix > vmax + 1e-12))
+            print(f"   [heatmap] matrix shape={importance_matrix.shape}, "
+                  f"panel max={importance_matrix.max():.4f}, "
+                  f"applied vmax={vmax:.4f}, clipped cells={n_clipped}")
 
         # ── heatmap ─────────────────────────────────────────────────────────
         im = ax.imshow(importance_matrix, aspect='auto', cmap=cmap,
-                       interpolation='nearest', vmin=0,
-                       vmax=importance_matrix.max())
+                       interpolation='nearest', vmin=0, vmax=vmax)
 
-        r2_full = row['conv_full_r2']
-        r2_matched = row['conv_matched_r2']
-        r2_alt = row['alt_r2']
+        r2_full = row['oob_full']
+        r2_matched = row['oob_matched']
+        r2_alt = row['oob_alt']
+
+
+        n_full = row['n_conventional_full']
+        n_matched =row["n_conventional_matched"]
+        n_alt = row['n_alternative']
 
         x_labels = [
-            f"{dataset_names_short[0]}\n$R^2_{{adj}}$ = {r2_full:.3f}",
-            f"{dataset_names_short[1]}\n$R^2_{{adj}}$ = {r2_matched:.3f}",
-            f"{dataset_names_short[2]}\n$R^2_{{adj}}$ = {r2_alt:.3f}",
+            f"{dataset_names_short[0]}\n$R^2_{{OOB}}$ = {r2_full:.3f}  \n n = {n_full}",
+            f"{dataset_names_short[1]}\n$R^2_{{OOB}}$ = {r2_matched:.3f} \n n = {n_matched}",
+            f"{dataset_names_short[2]}\n$R^2_{{OOB}}$ = {r2_alt:.3f} \n n = {n_alt}",
         ]
 
         ax.set_xticks(np.arange(3))
@@ -2231,14 +2527,17 @@ class RFFullFeatureImportanceAnalyzer(LoggerMixin):
         ax.set_yticklabels(features_display, fontsize=fs['tick'])
 
         # ── colorbar ────────────────────────────────────────────────────────
-        cbar = plt.colorbar(im, ax=ax, fraction=0.08, pad=0.04)
-        cbar.set_label('Feature Importance', rotation=270, labelpad=20,
-                       fontsize=fs['colorbar_label'])
-        cbar.ax.tick_params(labelsize=fs['tick'])
+        if draw_colorbar:
+            cbar = plt.colorbar(im, ax=ax, fraction=0.08, pad=0.04, extend=extend)
+            cbar.set_label('Feature Importance', rotation=270, labelpad=20,
+                           fontsize=fs['colorbar_label'])
+            cbar.ax.tick_params(labelsize=fs['tick'])
 
         # ── cell annotations ────────────────────────────────────────────────
+        # Threshold follows the *applied* vmax so text contrast stays correct
+        # when the scale is shared rather than panel-local.
         if annotate:
-            threshold = importance_matrix.max() * 0.5
+            threshold = vmax * 0.5
             for i in range(len(features)):
                 for j in range(3):
                     value = importance_matrix[i, j]
@@ -2265,11 +2564,7 @@ class RFFullFeatureImportanceAnalyzer(LoggerMixin):
             title += f' (Top {len(features)} Features)'
         ax.set_title(title, fontweight='bold', fontsize=fs['subplot_title'], pad=10)
 
-        # ── info box ────────────────────────────────────────────────────────
-        n_total = row['n_predictors']
-        n_conv_full = row['n_conventional_full']
-        n_conv_matched = row['n_conventional_matched']
-        n_alt = row['n_alternative']
+        return HeatmapPanelResult(features=features, mappable=im, vmax=vmax)
 
         # ax.text(0.02, 0.98,
         #         f'Total features: {n_total}\nSamples: {n_conv_full} / {n_conv_matched} / {n_alt}',
@@ -3753,3 +4048,98 @@ class RFFullFeatureImportanceAnalyzer(LoggerMixin):
         n_cols = -neg_n_cols
         n_rows = math.ceil(n_plots / n_cols)
         return n_rows, n_cols
+
+    def export_importance_summary(self,
+                                  filepath: str | Path = 'importance_summary.xlsx',
+                                  layout: str = 'wide',
+                                  min_r2: Optional[float] = None,
+                                  filter_dataset: str = 'alternative',
+                                  min_n_samples: Optional[int] = None,
+                                  variable_name_map: Optional[Dict[str, str]] = None,
+                                  alternative_dataset_name: str = 'Alternative',
+                                  float_precision: int = 3,
+                                  debug: bool = False) -> Optional[Path]:
+        """
+        Export a per-target, per-dataset importance summary to Excel.
+
+        For each retained target and each cohort (Conventional Full,
+        Conventional Matched, Alternative), the table reports the most
+        important predictor and the min / max / spread of the importance
+        distribution. The spread column is the concentration diagnostic:
+        top-feature identity should only be interpreted where the spread is
+        large, since near-uniform panels (importance diffusion under range
+        restriction) make rank swaps meaningless.
+
+        Filtering reuses :meth:`_filter_results_by_performance`, so the table
+        covers the same targets as the heatmap figures under the same
+        criteria. Table construction and export are delegated to
+        :class:`ImportanceSummaryTableBuilder`.
+
+        :param filepath: Destination ``.xlsx`` path.
+        :type filepath: str or pathlib.Path
+        :param layout: ``'wide'`` (default; one row per target with grouped
+            dataset columns) or ``'long'`` (one row per target-dataset pair,
+            convenient for further pandas processing).
+        :type layout: str
+        :param min_r2: Minimum R² threshold for retaining a target.
+        :type min_r2: float, optional
+        :param filter_dataset: Which dataset's R² is compared against
+            ``min_r2``.
+        :type filter_dataset: str
+        :param min_n_samples: Minimum number of alternative-fuel ships.
+        :type min_n_samples: int, optional
+        :param variable_name_map: Optional mapping from internal variable
+            names to publication-friendly labels.
+        :type variable_name_map: dict[str, str], optional
+        :param alternative_dataset_name: Display label for the alternative
+            cohort's column block.
+        :type alternative_dataset_name: str
+        :param float_precision: Decimal places for numeric columns.
+        :type float_precision: int
+        :param debug: Print filtering, per-target summaries, and export
+            diagnostics.
+        :type debug: bool
+        :returns: The output path, or ``None`` if there is nothing to export.
+        :rtype: pathlib.Path or None
+        """
+
+        if self.comparison_results is None or len(self.comparison_results) == 0:
+            print("No results to summarise. Run analyze_all_targets() first.")
+            return None
+
+        if debug:
+            print("\n🔍 DEBUG: export_importance_summary")
+            print(f"   Initial results count: {len(self.comparison_results)}")
+
+        results_df = self._filter_results_by_performance(
+            results_df=self.comparison_results,
+            min_r2=min_r2,
+            dataset=filter_dataset,
+            min_n_samples=min_n_samples,
+            verbose=self.verbose or debug,
+        )
+
+        if debug:
+            print(f"   Post-filtering count: {len(results_df)}")
+
+        if len(results_df) == 0:
+            print("⚠️  No targets meet performance criteria")
+            return None
+
+        labels = dict(ImportanceSummaryTableBuilder.DEFAULT_LABELS)
+        labels['alternative'] = alternative_dataset_name
+
+        builder = ImportanceSummaryTableBuilder(
+            comparison_results=results_df,
+            dataset_labels=labels,
+            variable_name_map=variable_name_map,
+            float_precision=float_precision,
+        )
+
+        output_path = builder.to_excel(filepath=filepath, layout=layout,
+                                       debug=debug)
+
+        if self.verbose or debug:
+            print(f"✅ Importance summary saved to {output_path}")
+
+        return output_path

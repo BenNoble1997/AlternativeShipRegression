@@ -973,7 +973,7 @@ class LaTeXFormatter:
             formatted = value_str
 
         # Highlight if requested and below threshold
-        if use_highlight and value < highlight_threshold:
+        if use_highlight and value < std or value<0:
             return f"\\textcolor{{red}}{{{formatted}}}"
 
         return formatted
@@ -1012,10 +1012,10 @@ class LaTeXFormatter:
             return "---"
 
         # Format with 1 decimal place
-        formatted = f"\\rrmse{{{rrmse:.1f}}}±{std:.1f}"
+        formatted = f"{rrmse:.1f}±{std:.1f}"
 
-        if use_highlight:
-            formatted = f"\\textbf{{{formatted}}}"
+        if use_highlight and rrmse<std:
+            formatted = f"\\textcolor{{red}}{{{formatted}}}"
 
         return formatted
 

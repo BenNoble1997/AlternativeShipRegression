@@ -6,8 +6,9 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import warnings
-from typing import List, Dict
+from typing import List, Dict, Sequence, Mapping
 from tqdm import tqdm
+from pathlib import Path
 
 from knowledge_layer.parametric_regression.parametric_model_factory import ModelFactory
 from knowledge_layer.parametric_regression.parametric_model_description_class import ModelDescriptor
@@ -17,10 +18,12 @@ from knowledge_layer.data_split_handling_class import DataSplitHandler
 from knowledge_layer.model_selectors.best_model_selector import BestModelSelector
 
 from knowledge_layer.model_plotting_utility_class import MetricsComparisonPlotter, ModelPlotter
-from knowledge_layer.model_selectors.ModelSelectionPlotter import ModelSelectionPlotter
+from knowledge_layer.model_selectors.ModelSelectionPlotter import ModelSelectionPlotter, ModelDisplaySelection
 from knowledge_layer.variable_combination_manager_class import VariableCombinationManager
 from knowledge_layer.Metrics.regression_metrics_class import RegressionMetrics
 from knowledge_layer.model_selectors.Selector_save_class import ResultsExporter
+
+from knowledge_layer.model_selectors.holdout_metric_evaluator_class import HoldoutMetricEvaluator
 warnings.filterwarnings('ignore')
 
 
@@ -53,7 +56,7 @@ class ParametricModelSelector:
                  piecewise_bins=None,
                  max_piecewise_predictors=1,
                  min_samples_per_bin=10,
-                 fit_mfp:bool=False,
+                 fit_mfp: bool | Sequence[str] = False,
 
                  verbose=True):
         """
@@ -189,8 +192,20 @@ class ParametricModelSelector:
         self.selection_metric = selection_metric
         self.include_regularized = include_regularized
         self.use_cv_regularization = use_cv_regularization
-        self.fit_mfp = fit_mfp
         self.verbose = verbose
+
+        # fit_mfp=True fits the FP1 and FP2 variants, which form a
+        # complexity ladder under a common testing convention.  Pass an
+        # explicit sequence to select variants, e.g. ['mfp1'] or the
+        # legacy ['mfp'].
+        if fit_mfp is True:
+            self.mfp_models = ['mfp1', 'mfp2']
+        elif fit_mfp:
+            self.mfp_models = list(fit_mfp)
+        else:
+            self.mfp_models = []
+        self.fit_mfp = bool(self.mfp_models)
+
 
         self.model_selector = BestModelSelector(
             selection_metric=selection_metric,
@@ -466,7 +481,7 @@ class ParametricModelSelector:
                        y,
                        predictor_combo: tuple|list[str],
                        target:str,
-                       exclude_models=None, cv_method=None,
+                       exclude_models=None, cv_method="stratified",
                        n_folds=10, groups=None, random_state=42):
         """
         Fit all applicable models to the data.
@@ -573,8 +588,14 @@ class ParametricModelSelector:
             )
             applicable_models.extend(piecewise_models)
 
-        if self.fit_mfp:
-            applicable_models.append('mfp')
+        for mfp_model in self.mfp_models:
+            ok, reason = ModelFactory.is_model_applicable(
+                model_type=mfp_model, X=X, y=y, min_samples=5
+            )
+            if ok:
+                applicable_models.append(mfp_model)
+            elif self.verbose:
+                print(f"  ⚠️  {mfp_model} not applicable: {reason}")
 
         # ====================================================================
         # Verbose Output: Only Warn if No Applicable Models
@@ -662,11 +683,16 @@ class ParametricModelSelector:
 
             metric_calculator = RegressionMetrics(y_pred, y)
             metrics = metric_calculator.calculate_all_metrics(actual_n_features)
-            het_scedast_result= metric_calculator.comprehensive_heteroscedasticity_analysis(X=X,feature_names=predictor_combo)
-            metrics['spearman'] = het_scedast_result['spearman']['overall']['heteroscedastic']
-            metrics['breusch_pagan'] = het_scedast_result['breusch_pagan']['heteroscedastic']
-            metrics['white'] = het_scedast_result['white']['heteroscedastic']
-            metrics['heteroscedasticity'] = het_scedast_result['summary']['conclusion']
+            # het_scedast_result= metric_calculator.comprehensive_heteroscedasticity_analysis(X=X,feature_names=predictor_combo)
+
+            metrics['spearman'] = metric_calculator.calculate_spearman_heteroscedasticity(X=X,feature_names=predictor_combo)['overall']['heteroscedastic']
+            metrics['breusch_pagan'] = metric_calculator.breusch_pagan_test(X=X,feature_names=predictor_combo)['heteroscedastic']
+            metrics['white'] = metric_calculator.white_test(X=X,feature_names=predictor_combo)['heteroscedastic']
+
+            # metrics['spearman'] = het_scedast_result['spearman']['overall']['heteroscedastic']
+            # metrics['breusch_pagan'] = het_scedast_result['breusch_pagan']['heteroscedastic']
+            # metrics['white'] = het_scedast_result['white']['heteroscedastic']
+            # metrics['heteroscedasticity'] = het_scedast_result['summary']['conclusion']
 
             descriptor = ModelDescriptor.from_fitted_model(
                 model=model, preprocessor=preprocessor, model_type=model_type,
@@ -706,7 +732,7 @@ class ParametricModelSelector:
             True if model selects features or transformations
         """
         structure_discovering = [
-            'mfp',  # Discovers transformations
+            'mfp', 'mfp1', 'mfp2',  # Discovers transformations
             'polynomial-2-lasso',  # Selects polynomial terms
             'polynomial-3-lasso',
             'polynomial-2-lasso-cv',
@@ -750,7 +776,7 @@ class ParametricModelSelector:
 
         if self.verbose:
             print(f"    Discovered structure: {actual_n_features} effective parameters")
-            if model_type == 'mfp':
+            if model_type.startswith('mfp'):
                 # Show count of transformations instead of details
                 n_transforms = sum(1 for t in descriptor.transformations.values() if t[0] != 'excluded')
                 print(f"    {n_transforms} variables with transformations")
@@ -1446,55 +1472,109 @@ class ParametricModelSelector:
         display = SelectorResultsDisplay(self)
         display.print_best_combinations_summary()
 
-
     def plot_metrics_comparison(self,
                                 max_predictors: int = 2,
                                 title: str | None = None,
                                 cv_method: str = None,
                                 metric: str = 'rrmse',
-                                ship_type: str|None = None,
-                                variable_name_map: dict[str,str]|None = None,
+                                ship_type: str | None = None,
+                                variable_name_map: dict[str, str] | None = None,
+                                model_name_map: dict[str, str] | None = None,
+                                highlight_best: bool = True,
+                                figsize: tuple | None = (10, 10),
+                                equivalence_tolerence: float = None,
+                                annotation_loc: str = "upper left",
                                 targets: list[str] = None,
-                                include_only_vars: list[str]|None = None,
+                                include_only_vars: list[str] | None = None,
                                 group_by_type: bool = False,
                                 figsize_per_plot: tuple = (8, 6),
-                                save_path: str = None):
+                                save_path: str = None,
+                                holdout: "HoldoutMetricEvaluator | None" = None,
+                                debug: bool = False):
         """
-        Plot comparison of best models for all target dimensions.
+        Plot the recommended model of every predictor combination, per target.
 
-        **Enhanced with ship type and variable name formatting.**
+        By default the plotted value is the one stored in ``detailed_results``:
+        the cross-validated mean on the full dataset (or the in-sample value when
+        the selector was run with ``cv_method=None``). Passing ``holdout`` replaces
+        it with the error of each recommended model trained on a train partition
+        and scored on a held-out test partition, which is what the domain-shift
+        analysis reports and selects on. The highlighted best combination then
+        agrees with the analysis.
 
-        Parameters
-        ----------
-        max_predictors : int
-            Maximum number of predictors to include in plot
-        title : str, optional
-            Custom title. If None, uses default.
-        cv_method : str, optional
-            CV method used (for title)
-        metric : str
-            Metric to plot ('adj_r2', 'rrmse', 'mape', 'r2')
-        ship_type : str, optional
-            Ship type to include in title, e.g., 'Container Ships'
-        variable_name_map : dict, optional
-            Dictionary mapping variable names to formatted display names.
-            Example: {'DWT': 'DWT (t)', 'LOA (M)': 'L_OA (m)'}
-        targets : list of str, optional
-            List of specific targets to plot. If None, plots all targets.
-            Example: ['LOA (M)', 'Beam (M)']
-        include_only_vars : list of str, optional
-            Only include combinations that use ONLY variables from this list.
-            All predictors in a combination must be in this list.
-            Example: ['DWT', 'GT', 'LOA (M)'] will exclude combinations
-            containing 'Beam (M)' or other variables.
-        group_by_type : bool
-            If True, creates separate plots for each combination type
-        figsize_per_plot : tuple
-            Size for each individual subplot
-        save_path : str, optional
-            Path to save the figure
-
+        :param max_predictors: Maximum number of predictors per combination.
+        :type max_predictors: int
+        :param title: Figure title. ``None`` uses a default, suffixed with
+            "(held-out test set)" when ``holdout`` is given.
+        :type title: str | None
+        :param cv_method: CV method label passed to the plotter. Ignored (set to
+            ``None``) when ``holdout`` is given, since no CV is involved.
+        :type cv_method: str | None
+        :param metric: Metric to plot. With ``holdout`` it must be one of
+            ``r2``, ``adj_r2``, ``rmse``, ``rrmse``, ``mae`` or ``mape``.
+        :type metric: str
+        :param ship_type: Ship type for the title.
+        :type ship_type: str | None
+        :param variable_name_map: Raw-to-display predictor and target names.
+        :type variable_name_map: dict[str, str] | None
+        :param model_name_map: Raw-to-display model names, e.g. ``{'linear': 'M1'}``.
+        :type model_name_map: dict[str, str] | None
+        :param highlight_best: Highlight the best combination per target.
+        :type highlight_best: bool
+        :param figsize: Overall figure size.
+        :type figsize: tuple | None
+        :param equivalence_tolerence: Currently unused; kept for compatibility.
+        :type equivalence_tolerence: float | None
+        :param annotation_loc: Corner for the plotter's annotation box.
+        :type annotation_loc: str
+        :param targets: Targets to plot. ``None`` plots all.
+        :type targets: list[str] | None
+        :param include_only_vars: Keep only combinations whose predictors all
+            appear in this list.
+        :type include_only_vars: list[str] | None
+        :param group_by_type: One figure per combination type.
+        :type group_by_type: bool
+        :param figsize_per_plot: Size of each subplot.
+        :type figsize_per_plot: tuple
+        :param save_path: Output path.
+        :type save_path: str | None
+        :param holdout: Evaluator supplying held-out test metrics. ``None`` keeps
+            the selector's stored metrics.
+        :type holdout: HoldoutMetricEvaluator | None
+        :param debug: Print the metric source, the holdout evaluation of each
+            combination and the values passed to the plotter.
+        :type debug: bool
         """
+        _HOLDOUT_METRICS = {'r2', 'adj_r2', 'rmse', 'rrmse', 'mae', 'mape'}
+
+        # ------------------------------------------------------------------
+        # 1. Resolve the metric source
+        # ------------------------------------------------------------------
+        metric_override = None
+
+        if holdout is not None:
+            if metric not in _HOLDOUT_METRICS:
+                raise ValueError(
+                    f"metric='{metric}' is not available from a held-out split. "
+                    f"Choose from {sorted(_HOLDOUT_METRICS)}."
+                )
+            metric_override = holdout.evaluate_recommendations(
+                selector=self,
+                targets=targets,
+                max_predictors=max_predictors,
+                include_only_vars=include_only_vars,
+                debug=debug,
+            )
+            cv_method = None
+
+        if debug:
+            src = (f"held-out test set ({holdout.source})" if holdout is not None
+                   else "selector detailed_results (CV mean / in-sample)")
+            print(f"[metrics_plot] metric='{metric}', source: {src}")
+
+        # ------------------------------------------------------------------
+        # 2. Grouped-by-type figures
+        # ------------------------------------------------------------------
         if group_by_type:
             self._plot_metrics_by_type(
                 max_predictors, metric, cv_method,
@@ -1502,35 +1582,80 @@ class ParametricModelSelector:
                 ship_type=ship_type,
                 variable_name_map=variable_name_map,
                 targets=targets,
-                include_only_vars=include_only_vars
+                include_only_vars=include_only_vars,
+                model_name_map=model_name_map,
+                metric_override=metric_override,
+                debug=debug,
             )
-        else:
-            results_by_target = self._prepare_plot_data(
-                max_predictors=max_predictors,
-                metric=metric,
-                variable_name_map=variable_name_map,
-                targets=targets,
-                include_only_vars=include_only_vars
-            )
+            return
 
-            if not results_by_target:
-                print("No results to plot after filtering!")
-                return
+        # ------------------------------------------------------------------
+        # 3. Single figure
+        # ------------------------------------------------------------------
+        results_by_target = self._prepare_plot_data(
+            max_predictors=max_predictors,
+            metric=metric,
+            variable_name_map=variable_name_map,
+            targets=targets,
+            include_only_vars=include_only_vars,
+            model_name_map=model_name_map,
+            metric_override=metric_override,
+            debug=debug,
+        )
 
-            if title is None:
-                title = 'Model Performance Comparison Across Dimensions'
+        if not results_by_target:
+            print("No results to plot after filtering!")
+            return
 
-            MetricsComparisonPlotter.plot_metrics_comparison(
-                results_by_target=results_by_target,
-                metric=metric,
-                cv_method=cv_method,
-                ship_type=ship_type,
-                variable_name_map=variable_name_map,
-                figsize_per_plot=figsize_per_plot,
-                title=title,
-                save_path=save_path,
-                verbose=self.verbose
-            )
+        if title is None:
+            title = 'Model Performance Comparison Across Dimensions'
+            # if holdout is not None:
+            #     title += ' (held-out test set)'
+
+        MetricsComparisonPlotter.plot_metrics_comparison(
+            results_by_target=results_by_target,
+            metric=metric,
+            cv_method=cv_method,
+            ship_type=ship_type,
+            variable_name_map=variable_name_map,
+            figsize_per_plot=figsize_per_plot,
+            figsize=figsize,
+            title=title,
+            save_path=save_path,
+            verbose=self.verbose,
+            highlight_best=highlight_best,
+            annotation_loc=annotation_loc,
+            model_name_map=model_name_map,
+        )
+
+    def _metrics_for_plot(self,
+                          key: tuple,
+                          model_name: str,
+                          metric_override: dict | None) -> dict | None:
+        """
+        Return the metrics dictionary a plot should read for one combination.
+
+        With no override this is the stored ``detailed_results`` entry. With an
+        override (e.g. held-out metrics) the override entry is returned, or
+        ``None`` if that combination could not be evaluated, so the caller can
+        drop it rather than silently mixing two metric sources in one figure.
+
+        :param key: ``(predictor_tuple, target)``.
+        :type key: tuple
+        :param model_name: Recommended model type for ``key``.
+        :type model_name: str
+        :param metric_override: ``{key: metrics_dict}`` or ``None``.
+        :type metric_override: dict | None
+        :returns: Metrics dictionary, or ``None`` if unavailable.
+        :rtype: dict | None
+        """
+        if metric_override is not None:
+            return metric_override.get(key)
+
+        model_results = self.detailed_results.get(key)
+        if model_results is None:
+            return None
+        return model_results.get(model_name)
 
     def _plot_metrics_by_type(self,
                               max_predictors: int,
@@ -1538,129 +1663,156 @@ class ParametricModelSelector:
                               cv_method: str,
                               figsize_per_plot: tuple,
                               save_path: str = None,
-                              ship_type: str|None = None,
-                              variable_name_map: dict[str,str]|None = None,
-                              targets: list[str]|None = None,
-                              include_only_vars: list[str]|None = None):
-        """Create separate full figures for each combination type."""
-        # Prepare data grouped by type
-        data_by_type = {}
+                              ship_type: str | None = None,
+                              variable_name_map: dict[str, str] | None = None,
+                              model_name_map: dict[str, str] | None = None,
+                              targets: list[str] | None = None,
+                              include_only_vars: list[str] | None = None,
+                              metric_override: dict | None = None,
+                              debug: bool = False):
+        """
+        Create one figure per combination type.
 
-        # Filter targets if specified
+        :param max_predictors: Maximum number of predictors per combination.
+        :type max_predictors: int
+        :param metric: Metric to plot.
+        :type metric: str
+        :param cv_method: CV label passed to the plotter.
+        :type cv_method: str | None
+        :param figsize_per_plot: Size of each subplot.
+        :type figsize_per_plot: tuple
+        :param save_path: Output path; ``_<type>`` is inserted before ``.png``.
+        :type save_path: str | None
+        :param ship_type: Ship type for the title.
+        :type ship_type: str | None
+        :param variable_name_map: Raw-to-display variable names.
+        :type variable_name_map: dict[str, str] | None
+        :param model_name_map: Raw-to-display model names.
+        :type model_name_map: dict[str, str] | None
+        :param targets: Targets to include. ``None`` includes all.
+        :type targets: list[str] | None
+        :param include_only_vars: Keep only combinations using these variables.
+        :type include_only_vars: list[str] | None
+        :param metric_override: ``{(predictor_tuple, target): metrics}`` replacing
+            the stored metrics, e.g. from a held-out evaluator.
+        :type metric_override: dict | None
+        :param debug: Print skipped combinations and per-type counts.
+        :type debug: bool
+        """
+        data_by_type = {}
         targets_to_plot = targets if targets else self.target_dimensions
 
         for (pred_combo, target), model_name in self.model_recommendations.items():
-            # Filter by target
             if target not in targets_to_plot:
                 continue
-
-            # Filter by max_predictors
             if len(pred_combo) > max_predictors:
                 continue
-
-            # Filter by include_only_vars
             if include_only_vars is not None:
                 if not all(var in include_only_vars for var in pred_combo):
                     continue
 
-            model_results = self.detailed_results[(pred_combo, target)]
-            metrics = model_results[model_name]
-            combo_type = metrics.get('combination_type', 'other')
+            key = (pred_combo, target)
+            metrics = self._metrics_for_plot(key, model_name, metric_override)
+            if metrics is None:
+                if debug:
+                    print(f"[metrics_plot] skip {' + '.join(pred_combo)} -> {target}: "
+                          f"no metrics from source")
+                continue
 
-            if combo_type not in data_by_type:
-                data_by_type[combo_type] = {}
+            # Combination type is a property of the combination, so it always
+            # comes from the stored results.
+            stored = self.detailed_results.get(key, {}).get(model_name, {})
+            combo_type = stored.get('combination_type', 'other')
 
-            if target not in data_by_type[combo_type]:
-                data_by_type[combo_type][target] = []
+            label = self._format_combination_label(
+                pred_combo, model_name, variable_name_map, model_name_map
+            )
 
-            # Format predictor names if mapping provided
-            if variable_name_map:
-                predictors_formatted = [variable_name_map.get(p, p) for p in pred_combo]
-                predictors_str = " + ".join(predictors_formatted)
-            else:
-                predictors_str = " + ".join(pred_combo)
-
-            label = f"{predictors_str}\n({model_name})"
-
-            data_by_type[combo_type][target].append({
+            data_by_type.setdefault(combo_type, {}).setdefault(target, []).append({
                 'label': label,
-                'metric_value': metrics[metric],
+                'metric_value': metrics.get(metric, np.nan),
                 'std_value': metrics.get(f'std_{metric}', 0),
                 'n_predictors': len(pred_combo),
-                'model_name': model_name
+                'model_name': model_name,
             })
 
         if not data_by_type:
             print("No data to plot after filtering")
             return
 
-        # Create a separate figure for each combination type
+        if debug:
+            for t, d in data_by_type.items():
+                print(f"[metrics_plot] type '{t}': "
+                      f"{sum(len(v) for v in d.values())} combinations")
+
         type_order = ['hull', 'tonnage', 'propulsion', 'mixed', 'other']
 
         for combo_type in type_order:
             if combo_type not in data_by_type:
                 continue
 
-            type_data = data_by_type[combo_type]
-
-            # Build title for this type
-            type_title = f"Model Performance - {combo_type.upper()} Combinations"
-
-            # Use the shared plotter for consistency
             MetricsComparisonPlotter.plot_metrics_comparison(
-                results_by_target=type_data,
+                results_by_target=data_by_type[combo_type],
                 metric=metric,
                 cv_method=cv_method,
                 ship_type=ship_type,
                 variable_name_map=variable_name_map,
                 figsize_per_plot=figsize_per_plot,
-                title=type_title,
-                save_path=save_path.replace('.png', f'_{combo_type}.png') if save_path else None,
-                verbose=self.verbose
+                title=f"Model Performance - {combo_type.upper()} Combinations",
+                save_path=(str(save_path).replace('.png', f'_{combo_type}.png')
+                           if save_path else None),
+                verbose=self.verbose,
             )
 
     def _prepare_plot_data(self,
                            max_predictors: int,
                            metric: str,
-                           filter_by_type: str|None = None,
-                           variable_name_map: dict[str,str]|None = None,
-                           targets: list[str]|None = None,
-                           include_only_vars: list[str]|None = None) -> dict[str, list[dict]]:
+                           filter_by_type: str | None = None,
+                           variable_name_map: dict[str, str] | None = None,
+                           targets: list[str] | None = None,
+                           include_only_vars: list[str] | None = None,
+                           model_name_map: dict[str, str] | None = None,
+                           metric_override: dict | None = None,
+                           debug: bool = False) -> dict[str, list[dict]]:
         """
-        Transform internal data structure to format expected by plotter.
+        Transform fitted results into the structure the metrics plotter expects.
 
-        **Key Concept**: Don't regenerate combinations - use what was actually fitted!
-        This ensures plots match analysis results exactly, respecting all filters.
+        Combinations are taken from ``model_recommendations`` (what was actually
+        fitted), never regenerated. The metric value for each combination comes
+        from :meth:`_metrics_for_plot`, so a ``metric_override`` (e.g. held-out
+        test metrics) can replace the stored values without changing which
+        combinations or labels are shown.
 
-        Parameters
-        ----------
-        max_predictors : int
-            Maximum number of predictors
-        metric : str
-            Metric to extract
-        filter_by_type : str, optional
-            Filter by combination type
-        variable_name_map : dict, optional
-            Variable name formatting
-        targets : list of str, optional
-            Specific targets to include. If None, uses all targets.
-        include_only_vars : list of str, optional
-            Only include combinations where ALL predictors are in this list.
-
-        Returns
-        -------
-        dict
-            {target: [result_dicts]}
+        :param max_predictors: Maximum number of predictors.
+        :type max_predictors: int
+        :param metric: Metric to extract.
+        :type metric: str
+        :param filter_by_type: Keep only this combination type.
+        :type filter_by_type: str | None
+        :param variable_name_map: Raw-to-display variable names.
+        :type variable_name_map: dict[str, str] | None
+        :param targets: Targets to include. ``None`` includes all.
+        :type targets: list[str] | None
+        :param include_only_vars: Keep only combinations whose predictors all
+            appear in this list.
+        :type include_only_vars: list[str] | None
+        :param model_name_map: Raw-to-display model names.
+        :type model_name_map: dict[str, str] | None
+        :param metric_override: ``{(predictor_tuple, target): metrics}`` replacing
+            the stored metrics.
+        :type metric_override: dict | None
+        :param debug: Print each combination's plotted value and any skips.
+        :type debug: bool
+        :returns: ``{target: [result_dict, ...]}`` sorted by number of predictors,
+            then by metric (best first).
+        :rtype: dict[str, list[dict]]
         """
         results_by_target = {}
 
-        # Determine which targets to plot
         if targets is not None:
-            # Validate that specified targets exist
             invalid_targets = [t for t in targets if t not in self.target_dimensions]
-            if invalid_targets:
-                if self.verbose:
-                    print(f"Warning: These targets not found: {invalid_targets}")
+            if invalid_targets and self.verbose:
+                print(f"Warning: These targets not found: {invalid_targets}")
             targets_to_plot = [t for t in targets if t in self.target_dimensions]
         else:
             targets_to_plot = self.target_dimensions
@@ -1670,51 +1822,41 @@ class ParametricModelSelector:
                 print("No valid target dimensions to plot!")
             return results_by_target
 
-        # ✅ Iterate through fitted combinations directly
+        lower_is_better = metric in {'rrmse', 'rmse', 'mape', 'mae', 'bic', 'aic'}
+        sign = 1 if lower_is_better else -1
+
         for target in targets_to_plot:
             target_results = []
 
-            # Get all combinations that were actually fitted for this target
             for (pred_combo, tgt), best_model_name in self.model_recommendations.items():
                 if tgt != target:
                     continue
-
-                # Filter by number of predictors
                 if len(pred_combo) > max_predictors:
                     continue
-
-                # ✅ NEW: Filter by include_only_vars
                 if include_only_vars is not None:
-                    # Check if ALL predictors in combo are in include_only_vars list
                     if not all(var in include_only_vars for var in pred_combo):
                         continue
 
-                # Get results
-                if (pred_combo, target) not in self.detailed_results:
+                key = (pred_combo, target)
+                metrics = self._metrics_for_plot(key, best_model_name, metric_override)
+
+                if metrics is None:
+                    if debug:
+                        print(f"[metrics_plot] skip {' + '.join(pred_combo)} -> {target}: "
+                              f"no metrics from source")
                     continue
 
-                model_results = self.detailed_results[(pred_combo, target)]
-
-                if best_model_name not in model_results:
-                    continue
-
-                metrics = model_results[best_model_name]
-
-                # Filter by type if requested
-                if filter_by_type and metrics.get('combination_type') != filter_by_type:
-                    continue
+                if filter_by_type:
+                    stored = self.detailed_results.get(key, {}).get(best_model_name, {})
+                    if stored.get('combination_type') != filter_by_type:
+                        continue
 
                 metric_value = metrics.get(metric, np.nan)
                 std_value = metrics.get(f'std_{metric}', 0)
 
-                # Format predictor names if mapping provided
-                if variable_name_map:
-                    predictors_formatted = [variable_name_map.get(p, p) for p in pred_combo]
-                    predictors_str = " + ".join(predictors_formatted)
-                else:
-                    predictors_str = " + ".join(pred_combo)
-
-                label = f"{predictors_str}\n({best_model_name})"
+                label = self._format_combination_label(
+                    pred_combo, best_model_name, variable_name_map, model_name_map
+                )
 
                 target_results.append({
                     'label': label,
@@ -1722,11 +1864,16 @@ class ParametricModelSelector:
                     'std_value': std_value,
                     'n_predictors': len(pred_combo),
                     'model_name': best_model_name,
-                    'predictors': pred_combo
+                    'predictors': pred_combo,
                 })
 
-            # Sort by number of predictors, then by metric value
-            target_results.sort(key=lambda x: (x['n_predictors'], -x['metric_value']))
+            target_results.sort(key=lambda x: (x['n_predictors'], sign * x['metric_value']))
+
+            if debug and target_results:
+                print(f"[metrics_plot] {target}:")
+                for r in target_results:
+                    print(f"[metrics_plot]   {' + '.join(r['predictors']):<30s} "
+                          f"{r['model_name']:<20s} {metric}={r['metric_value']:.4g}")
 
             if target_results:
                 results_by_target[target] = target_results
@@ -1840,6 +1987,31 @@ class ParametricModelSelector:
                    label='Low variance zone')
 
         ax.legend(fontsize=8)
+
+
+    def _format_combination_label(self,
+                                  pred_combo: tuple[str, ...],
+                                  model_name: str,
+                                  variable_name_map: dict[str, str] | None = None,
+                                  model_name_map: dict[str, str] | None = None) -> str:
+        """
+        Build the display label for one predictor combination.
+
+        :param pred_combo: Predictor names as stored in ``model_recommendations``.
+        :param model_name: Internal model type selected for this combination.
+        :param variable_name_map: Optional display names for predictors. Keys not
+            present fall back to the raw name.
+        :param model_name_map: Optional display names for model types. Keys not
+            present fall back to the raw name.
+        :returns: Two-line label, predictors on top and model beneath.
+        """
+        if variable_name_map:
+            predictors = [variable_name_map.get(p, p) for p in pred_combo]
+        else:
+            predictors = list(pred_combo)
+
+        display_model = (model_name_map or {}).get(model_name, model_name)
+        return f"{' + '.join(predictors)}\n({display_model})"
 
     def plot_single_predictor_regressions(self,
                                           target: str,
@@ -2133,6 +2305,8 @@ class ParametricModelSelector:
             Template for save paths. Use {target} as placeholder.
             Example: 'plots/regression_{target}.png'
         """
+        print("plot all single predictor regressions")
+
         for target in self.target_dimensions:
             if save_path_template:
                 save_path = save_path_template.format(target=target.replace(' ', '_'))
@@ -2740,60 +2914,100 @@ class ParametricModelSelector:
                 print(f"   Failed: {n_failed}")
             print("=" * 70 + "\n")
 
-
-    def plot_model_selection(self,
-                             predictor_combo: tuple[str, ...],
-                             target: str,
-                             metric: str|None = None,
-                             ship_type: str|None = None,
-                             variable_name_map: dict[str,str]|None = None,
-                             highlight_selected: bool = True,
-                             show_values: bool = True,
-                             figsize: tuple[float, float] = (10, 6),
-                             save_path: str|None = None,
-                             show_hetero:bool=True):
+    def plot_model_selection(
+            self,
+            predictor_combo: tuple[str, ...],
+            target: str,
+            metric: str | None = None,
+            ship_type: str | None = None,
+            variable_name_map: dict[str, str] | None = None,
+            include: Sequence[str] | None = None,
+            exclude: Sequence[str] | None = None,
+            name_map: Mapping[str, str] | None = None,
+            preserve_include_order: bool = False,
+            highlight_selected: bool = True,
+            show_values: bool = True,
+            show_hetero: bool = True,
+            legend_loc: str = 'upper left',
+            info_box_loc: str | None = None,
+            figsize: tuple[float, float] = (10, 6),
+            save_path: str | Path | None = None,
+            plt_show: bool = False,
+            debug: bool = False,
+    ):
         """
-        Plot comparison of all models tested for a specific combination.
+        Plot a comparison of all models tested for one combination.
 
-        Shows why a particular model was selected by displaying all tested
-        models and their performance on the selection metric.
+        Thin wrapper that bundles the model filtering and renaming options into a
+        :class:`ModelDisplaySelection` and delegates rendering to
+        :meth:`ModelSelectionPlotter.plot_model_selection_comparison`.
 
-        Parameters
-        ----------
-        predictor_combo : tuple of str
-            Predictor combination, e.g., ('DWT',) or ('DWT', 'GT')
-        target : str
-            Target variable
-        metric : str, optional
-            Metric to display. If None, uses selector's selection_metric.
-        ship_type : str, optional
-            Ship type to include in title, e.g., 'Container Ships'
-        variable_name_map : dict, optional
-            Dictionary mapping variable names to formatted display names.
-            Example: {'DWT': 'DWT (t)', 'LOA (M)': 'L_OA (m)'}
-        highlight_selected : bool, default=True
-            Highlight the selected model in different color
-        show_values : bool, default=True
-            Show metric values on bars
-        figsize : tuple, default=(10, 6)
-            Figure size
-        save_path : str, optional
-            Path to save figure
-
+        :param predictor_combo: Predictor combination, e.g. ``('DWT',)``.
+        :type predictor_combo: tuple[str, ...]
+        :param target: Target variable.
+        :type target: str
+        :param metric: Metric to display. ``None`` uses ``self.selection_metric``.
+        :type metric: str | None
+        :param ship_type: Ship type used as a title prefix.
+        :type ship_type: str | None
+        :param variable_name_map: Raw-to-display names for predictors and target.
+        :type variable_name_map: dict[str, str] | None
+        :param include: Raw model names to show. ``None`` shows all.
+        :type include: Sequence[str] | None
+        :param exclude: Raw model names to hide, applied after ``include``.
+        :type exclude: Sequence[str] | None
+        :param name_map: Raw model name to display label, e.g. ``{'linear': 'M1'}``.
+        :type name_map: Mapping[str, str] | None
+        :param preserve_include_order: Keep ``include`` order instead of sorting
+            by metric.
+        :type preserve_include_order: bool
+        :param highlight_selected: Colour the selected model differently.
+        :type highlight_selected: bool
+        :param show_values: Annotate bars with metric values.
+        :type show_values: bool
+        :param show_hetero: Show heteroscedasticity indicators on tick labels.
+        :type show_hetero: bool
+        :param legend_loc: Legend position: a corner name, ``'best'`` or
+            ``'outside right'``. Defaults to ``'upper left'``.
+        :type legend_loc: str
+        :param info_box_loc: Corner for the Delta-AIC/BIC note. ``None`` places it
+            in a free left-hand corner.
+        :type info_box_loc: str | None
+        :param figsize: Figure size in inches.
+        :type figsize: tuple[float, float]
+        :param save_path: Optional output path.
+        :type save_path: str | Path | None
+        :param plt_show: Call ``plt.show()`` after rendering.
+        :type plt_show: bool
+        :param debug: Print stage-by-stage diagnostics.
+        :type debug: bool
+        :returns: The figure and axes produced.
+        :rtype: Tuple[matplotlib.figure.Figure, matplotlib.axes.Axes]
         """
+        model_selection = ModelDisplaySelection(
+            include=include,
+            exclude=exclude,
+            name_map=name_map,
+            preserve_include_order=preserve_include_order,
+        )
 
-        ModelSelectionPlotter.plot_model_selection_comparison(
+        return ModelSelectionPlotter.plot_model_selection_comparison(
             selector=self,
             predictor_combo=predictor_combo,
             target=target,
             metric=metric,
             ship_type=ship_type,
             variable_name_map=variable_name_map,
+            model_selection=model_selection,
             highlight_selected=highlight_selected,
             show_values=show_values,
+            show_heteroscedasticity=show_hetero,
+            legend_loc=legend_loc,
+            info_box_loc=info_box_loc,
             figsize=figsize,
             save_path=save_path,
-            show_heteroscedasticity=show_hetero
+            show_plot=plt_show,
+            debug=debug,
         )
 
 
@@ -2884,7 +3098,7 @@ class ParametricModelSelector:
             *predictor* is supplied but no single-predictor combination for it
             exists in ``detailed_results``.
         """
-
+        print("plot predictor functions")
         # =========================================================================
         # 1. Validate inputs
         # =========================================================================
@@ -3217,3 +3431,128 @@ class ParametricModelSelector:
                         print(f"  Saved: {path}")
 
                 plt.show()
+
+    def get_holdout_metrics(self,
+                            metric: str = 'rrmse',
+                            dataset:pd.DataFrame|None = None,
+                            test_size: float = 0.2,
+                            random_state: int = 42,
+                            stratify_col: str = 'DWT',
+                            n_bins: int = 5,
+                            max_predictors: int | None = 2,
+                            targets: list[str] | None = None,
+                            include_only_vars: list[str] | None = None,
+                            debug: bool = False,
+                            ) -> "tuple[pd.DataFrame, HoldoutMetricEvaluator]":
+        """
+        Score every recommended model on a train/test split built from the
+        selector's own data, and compare with the stored (CV) value.
+
+        The split is created here, for this check only: ``self.data`` is
+        partitioned by row position, stratified on quantile bins of
+        ``stratify_col``. Each recommended model is fitted on the train partition
+        and scored on the test partition; NRMSE is normalised by the target mean of
+        the full ``self.data``. The stored ``detailed_results`` are not modified.
+
+        :param metric: Metric to compare. One of ``r2``, ``adj_r2``, ``rmse``,
+            ``rrmse``, ``mae``, ``mape``.
+        :type metric: str
+        :param test_size: Fraction of rows held out for testing.
+        :type test_size: float
+        :param random_state: Seed for the split.
+        :type random_state: int
+        :param stratify_col: Column whose quantile bins stratify the split.
+        :type stratify_col: str
+        :param n_bins: Number of quantile bins.
+        :type n_bins: int
+        :param max_predictors: Skip combinations with more predictors. ``None``
+            keeps all.
+        :type max_predictors: int | None
+        :param targets: Targets to include. ``None`` includes all.
+        :type targets: list[str] | None
+        :param include_only_vars: Keep only combinations whose predictors all
+            appear in this list.
+        :type include_only_vars: list[str] | None
+        :param debug: Print the split and each combination's test score.
+        :type debug: bool
+        :returns: A comparison table and the evaluator. The table has one row per
+            combination with columns ``target``, ``predictors``, ``model``,
+            ``stored_<metric>``, ``test_<metric>``, ``difference``, ``n_train``,
+            ``n_test``, ``best_stored`` and ``best_test``. The evaluator can be
+            passed to :meth:`plot_metrics_comparison` as ``holdout``.
+        :rtype: tuple[pandas.DataFrame, HoldoutMetricEvaluator]
+        :raises ValueError: If ``metric`` is not available on a held-out split, or
+            no combination could be evaluated.
+        """
+        allowed = {'r2', 'adj_r2', 'rmse', 'rrmse', 'mae', 'mape'}
+        if metric not in allowed:
+            raise ValueError(f"metric='{metric}' not available on a held-out split. "
+                             f"Choose from {sorted(allowed)}.")
+
+        if dataset is None:
+            dataset = self.data
+
+        # 1. Build the split from the selector's own data
+        evaluator = HoldoutMetricEvaluator.from_stratified_split(
+            data=dataset,
+            test_size=test_size,
+            random_state=random_state,
+            stratify_col=stratify_col,
+            n_bins=n_bins,
+            debug=debug,
+        )
+
+        # 2. Fit on train, score on test, for every recommended combination
+        holdout = evaluator.evaluate_recommendations(
+            selector=self,
+            targets=targets,
+            max_predictors=max_predictors,
+            include_only_vars=include_only_vars,
+            debug=debug,
+        )
+
+        if not holdout:
+            raise ValueError("No combination could be evaluated on the held-out split.")
+
+        # 3. Put stored and test values side by side
+        rows = []
+        for (pred_combo, target), test_metrics in holdout.items():
+            model_name = self.model_recommendations[(pred_combo, target)]
+            stored = self.detailed_results.get((pred_combo, target), {}).get(model_name, {})
+            stored_val = stored.get(metric, np.nan)
+            test_val = test_metrics.get(metric, np.nan)
+            rows.append({
+                'target': target,
+                'predictors': ' + '.join(pred_combo),
+                'model': model_name,
+                f'stored_{metric}': stored_val,
+                f'test_{metric}': test_val,
+                'difference': test_val - stored_val,
+                'n_train': test_metrics.get('n_train'),
+                'n_test': test_metrics.get('n_samples'),
+            })
+
+        df = pd.DataFrame(rows)
+
+        # 4. Flag the best combination per target under each source
+        lower_is_better = metric in {'rrmse', 'rmse', 'mape', 'mae'}
+        pick = 'idxmin' if lower_is_better else 'idxmax'
+        df['best_stored'] = False
+        df['best_test'] = False
+        for _, grp in df.groupby('target'):
+            df.loc[getattr(grp[f'stored_{metric}'], pick)(), 'best_stored'] = True
+            df.loc[getattr(grp[f'test_{metric}'], pick)(), 'best_test'] = True
+
+        df = df.sort_values(['target', f'test_{metric}'],
+                            ascending=[True, lower_is_better]).reset_index(drop=True)
+
+        if debug:
+            changed = (df.groupby('target')
+                       .apply(lambda g: g.loc[g.best_stored, 'predictors'].tolist()
+                                        != g.loc[g.best_test, 'predictors'].tolist()))
+            print(f"[holdout check] {len(df)} combinations, "
+                  f"mean |difference| = {df['difference'].abs().mean():.3f}")
+            print(f"[holdout check] targets whose best combination changes: "
+                  f"{changed[changed].index.tolist() or 'none'}")
+
+        return df, evaluator

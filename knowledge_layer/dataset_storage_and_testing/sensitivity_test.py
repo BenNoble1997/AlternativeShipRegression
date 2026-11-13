@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 
-from distribution_comparison_class import DistributionComparison
+from knowledge_layer.dataset_storage_and_testing.distribution_comparison_class import DistributionComparison
 from typing import List
 from knowledge_layer.fleet_data_class.fleet_data_class import FleetData
 

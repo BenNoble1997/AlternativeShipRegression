@@ -546,7 +546,7 @@ class LiteratureFormulaLatexGenerator:
         self.shiptype = getattr(evaluator, 'shiptype', None)
 
         # ── Build merged maps ──────────────────────────────────────────────
-        merged_display = dict(DEFAULT_NOTATION_MAP)
+        merged_display = dict(DEFAULT_DISPLAY_MAP)
         if display_map:
             merged_display.update(display_map)
 
@@ -562,6 +562,19 @@ class LiteratureFormulaLatexGenerator:
         self.renderer = LiteratureFormulaRenderer(notation_map=self.notation_map)
 
         # ── NEW: metric validation ─────────────────────────────────────────────
+
+    def _display_cell(self, var: str) -> str:
+        """
+        Render a variable name for the Target / Predictor columns.
+
+        Values taken from display_map are already LaTeX (they may contain $...$
+        and macros) and must be passed through untouched. A variable with no map
+        entry is plain text and is escaped.
+        """
+        latex = self.display_map.get(var)
+        if latex is not None:
+            return latex
+        return self.formatter.escape_latex(var)
 
     def _metrics_are_valid(self,
                            r2: Optional[float],
@@ -743,41 +756,52 @@ class LiteratureFormulaLatexGenerator:
         return True
 
     def _prepare_rows(self,
-                      targets:    Optional[List[str]],
+                      targets: Optional[List[str]],
                       references: Optional[List[str]],
-                      debug:      bool) -> List[Dict]:
+                      debug: bool) -> List[Dict]:
         """
         Build a list of row dicts from self.formulae.
 
         Steps
         -----
-        1. Build metric lookup dict from comparison_results for O(1) access.
+        1. Build metric lookup dict from comparison_results for O(1) access,
+           keyed on formula_id where available and formula_name otherwise.
         2. Iterate formulae, apply target/reference filters.
         3. Call LiteratureFormulaRenderer.render() for each formula.
         4. Look up conventional R² and RRMSE (averaged across fuel types if
            multiple fuel types are present in comparison_results).
         5. Filter rows whose metrics fall outside the configured thresholds.
         6. Return list sorted by target then number of predictors.
+
+        The read key is derived from the same `key_col` used to build the
+        lookup, so both sides fall back to formula_name together if
+        comparison_results predates the formula_id column. Hardcoding either
+        side produces a silent total miss: every formula gets None and the
+        table renders '---' throughout.
         """
         # ── Build metric lookup ───────────────────────────────────────────
         metric_lookup: Dict[str, Dict[str, Optional[float]]] = {}
+        key_col = 'formula_name'
 
         if self._comparison_results is not None and len(self._comparison_results) > 0:
             cr = self._comparison_results
             if 'formula_name' in cr.columns:
-                r2_col    = 'conventional_r2'    if 'conventional_r2'    in cr.columns else None
+                r2_col = 'conventional_r2' if 'conventional_r2' in cr.columns else None
                 rrmse_col = 'conventional_rrmse' if 'conventional_rrmse' in cr.columns else None
-                for fname, grp in cr.groupby('formula_name'):
-                    metric_lookup[fname] = {
-                        'r2':    float(grp[r2_col].mean())    if r2_col    else None,
+                key_col = 'formula_id' if 'formula_id' in cr.columns else 'formula_name'
+
+                for key, grp in cr.groupby(key_col):
+                    metric_lookup[key] = {
+                        'r2': float(grp[r2_col].mean()) if r2_col else None,
                         'rrmse': float(grp[rrmse_col].mean()) if rrmse_col else None,
                     }
 
-        if debug and metric_lookup:
-            print(f"  [_prepare_rows] Metric lookup built for {len(metric_lookup)} formulae")
+        if debug:
+            print(f"  [_prepare_rows] Metric lookup keyed on '{key_col}', "
+                  f"{len(metric_lookup)} entries")
 
         # ── Build rows ────────────────────────────────────────────────────
-        rows     = []
+        rows = []
         n_skipped = 0
 
         for formula in self.formulae:
@@ -796,18 +820,21 @@ class LiteratureFormulaLatexGenerator:
                     print(f"  ⚠️  Render error for {formula.name}: {exc}")
                 formula_latex = r'\text{(render error)}'
 
-            target_display = self.display_map.get(formula.target, formula.target)
-            preds_display  = ', '.join(
-                self.display_map.get(p, p) for p in formula.predictors
-            )
-            metrics = metric_lookup.get(formula.name, {'r2': None, 'rrmse': None})
+            target_display = self._display_cell(formula.target)
+            preds_display = ', '.join(self._display_cell(p) for p in formula.predictors)
+
+            lookup_key = formula.formula_id if key_col == 'formula_id' else formula.name
+            metrics = metric_lookup.get(lookup_key, {'r2': None, 'rrmse': None})
+
+            if debug and lookup_key not in metric_lookup:
+                print(f"  [_prepare_rows] No metrics for key '{lookup_key}'")
 
             # ── Quality gate ──────────────────────────────────────────────
             if not self._metrics_are_valid(metrics['r2'], metrics['rrmse']):
                 n_skipped += 1
                 if self.verbose:
                     print(
-                        f"  ⚠️  Skipping '{formula.name}': "
+                        f"  ⚠️  Skipping '{formula.name}' [ref {formula.reference}]: "
                         f"R²={metrics['r2']}, RRMSE={metrics['rrmse']}% "
                         f"— outside thresholds "
                         f"(R² ∈ [{self._r2_min}, {self._r2_max}], "
@@ -816,20 +843,22 @@ class LiteratureFormulaLatexGenerator:
                 continue
 
             rows.append({
-                'target':             formula.target,
-                'target_display':     target_display,
-                'predictors':         formula.predictors,
+                'formula_id': formula.formula_id,
+                'target': formula.target,
+                'target_display': target_display,
+                'predictors': formula.predictors,
                 'predictors_display': preds_display,
-                'formula_latex':      formula_latex,
-                'formula_type':       formula.formula_type,
-                'reference':          formula.reference or '---',
-                'n_predictors':       len(formula.predictors),
-                'conventional_r2':    metrics['r2'],
+                'formula_latex': formula_latex,
+                'formula_type': formula.formula_type,
+                'reference': formula.reference or '---',
+                'n_predictors': len(formula.predictors),
+                'conventional_r2': metrics['r2'],
                 'conventional_rrmse': metrics['rrmse'],
             })
 
             if debug:
-                print(f"  conventional_r2={metrics['r2']}, conventional_rrmse={metrics['rrmse']}")
+                print(f"  conventional_r2={metrics['r2']}, "
+                      f"conventional_rrmse={metrics['rrmse']}")
 
         rows.sort(key=lambda r: (r['target'], r['n_predictors']))
 
@@ -861,7 +890,7 @@ class LiteratureFormulaLatexGenerator:
         lines.append(rf'\begin{{{env}}}[ht]')
         lines.append(r'\centering')
         lines.append(r'\footnotesize')
-        lines.append(rf'\caption{{{self.formatter.escape_latex(caption)}}}')
+        lines.append(rf'\caption{{{caption}}}')
         lines.append(rf'\label{{{label}}}')
 
         # ── Column spec ────────────────────────────────────────────────────
@@ -880,7 +909,7 @@ class LiteratureFormulaLatexGenerator:
 
         def _rcol(frac: str) -> str:
             """Raggedright p-column — prevents hyphenation stretch in narrow cells."""
-            return rf'>{{\\raggedright\\arraybackslash}}p{{{frac}\linewidth}}'
+            return rf'>{{\raggedright\arraybackslash}}p{{{frac}\linewidth}}'
 
         colspec = (
             _pcol(col_fracs['target'])
@@ -916,8 +945,8 @@ class LiteratureFormulaLatexGenerator:
                 lines.append(r'\midrule')
             prev_target = row['target']
 
-            cell_target  = self.formatter.escape_latex(row['target_display'])
-            cell_preds   = self.formatter.escape_latex(row['predictors_display'])
+            cell_target = row['target_display']
+            cell_preds = row['predictors_display']
 
             # Piecewise formulas need \displaystyle for readable cases environment
             if r'\begin{cases}' in row['formula_latex']:

@@ -85,57 +85,38 @@ class MFPFitter(BaseModelFitter):
     :class:`~knowledge_layer.parametric_regression.parametric_model_factory.ModelFactory`
     dispatch system.
     """
+    #: Model-type keys handled by this fitter, and the MFPRegressor
+    #: configuration each one denotes.
+    #:
+    #: 'mfp'  is the legacy key, retained so existing configurations and
+    #:        stored results remain reproducible.
+    #: 'mfp1' permits {excluded, linear, FP1}: one regression term per
+    #:        retained variable.
+    #: 'mfp2' permits {excluded, linear, FP1, FP2}.
+    #:
+    #: 'mfp1' and 'mfp2' both use df_accounting='royston'.  This matters:
+    #: 'mfp1' *requires* it (linear and FP1 contribute the same number of
+    #: terms, so under term-count accounting the linear-vs-FP1 test has
+    #: zero degrees of freedom and FP1 can never be selected), and giving
+    #: 'mfp2' the same convention keeps the pair differing in exactly one
+    #: respect: the permitted family.  A comparison between an FP1 model
+    #: on 'royston' df and an FP2 model on 'terms' df would confound the
+    #: family with the testing convention.
+    MODEL_CONFIG = {
+        'mfp': {'max_degree': 2, 'df_accounting': 'terms'},
+        'mfp1': {'max_degree': 1, 'df_accounting': 'royston'},
+        'mfp2': {'max_degree': 2, 'df_accounting': 'royston'},
+    }
 
     # =========================================================================
     # BaseModelFitter Interface
     # =========================================================================
 
     def get_available_models(self) -> List[str]:
-        """
-        Return the single model-type string handled by this fitter.
+        return list(self.MODEL_CONFIG)
 
-        :returns: ``['mfp']``
-        :rtype: list[str]
-        """
-        return ['mfp']
-
-    def is_applicable(
-        self,
-        model_type: str,
-        X: np.ndarray,
-        y: np.ndarray,
-        min_samples: int = 5,
-    ) -> Tuple[bool, str]:
-        """
-        Check whether the MFP algorithm can be applied to the data.
-
-        MFP requires more samples than predictors because it must fit a
-        linear regression to all remaining variables as part of the
-        likelihood-ratio test at each step of backward elimination.  With
-        ``n_samples ≤ n_features`` the system is underdetermined and the
-        test statistics are meaningless.
-
-        A rule of thumb of at least 10 observations per predictor is
-        recommended for stable transformation discovery (Royston &
-        Sauerbrei, 2008, §4.2).  This threshold is noted internally but
-        does not block applicability — the call still proceeds with a
-        warning logged at a higher level.
-
-        :param model_type: Must be ``'mfp'``.
-        :type model_type: str
-        :param X: Predictor matrix, shape ``(n_samples, n_features)``.
-        :type X: numpy.ndarray
-        :param y: Target vector, shape ``(n_samples,)``.  Unused in
-            constraint checking; accepted for interface compatibility.
-        :type y: numpy.ndarray
-        :param min_samples: Minimum number of required samples.
-        :type min_samples: int
-
-        :returns: ``(True, '')`` if applicable; ``(False, reason)``
-            otherwise.
-        :rtype: tuple[bool, str]
-        """
-        if model_type != 'mfp':
+    def is_applicable(self, model_type, X, y, min_samples: int = 5):
+        if model_type not in self.MODEL_CONFIG:
             return False, f"model type '{model_type}' not handled by MFPFitter"
 
         n_samples = len(X)
@@ -144,13 +125,32 @@ class MFPFitter(BaseModelFitter):
         if n_samples < min_samples:
             return False, f"insufficient samples ({n_samples} < {min_samples})"
 
-        if n_samples <= n_features:
+        # Terms in the largest model the closed test may reach.  MFP fits
+        # this model at every step of the function selection procedure, so
+        # the design must be overdetermined for it, not merely for the
+        # model that is eventually selected.
+        max_degree = self.MODEL_CONFIG[model_type]['max_degree']
+        max_terms = (1 if max_degree <= 1 else 2) * n_features
+
+        if n_samples <= max_terms:
             return False, (
-                f"insufficient samples for MFP "
-                f"({n_samples} samples ≤ {n_features} predictors)"
+                f"insufficient samples for {model_type} "
+                f"({n_samples} samples ≤ {max_terms} terms at "
+                f"max_degree={max_degree})"
             )
 
         return True, ""
+
+    @classmethod
+    def _config(cls, model_type: str) -> dict:
+        """Return the MFPRegressor configuration for a model-type key."""
+        try:
+            return cls.MODEL_CONFIG[model_type]
+        except KeyError:
+            raise ValueError(
+                f"model type '{model_type}' not handled by MFPFitter; "
+                f"expected one of {sorted(cls.MODEL_CONFIG)}"
+            ) from None
 
     def create_and_fit(
         self,
@@ -161,6 +161,8 @@ class MFPFitter(BaseModelFitter):
         alpha2: Optional[float] = None,
         powers: Optional[List[float]] = None,
         max_cycles: int = 20,
+            max_degree=None,
+            df_accounting=None,
         verbose: bool = False,
         fixed_transforms: Optional[dict] = None,
         feature_names: Optional[List[str]] = None,
@@ -224,11 +226,17 @@ class MFPFitter(BaseModelFitter):
             and applies its transformations internally.
         :rtype: tuple[MFPRegressor, None]
         """
+        config = self._config(model_type)
+
         mfp = MFPRegressor(
             alpha1=alpha1 if alpha1 is not None else 0.05,
             alpha2=alpha2 if alpha2 is not None else 0.05,
             powers=powers,
             max_cycles=max_cycles,
+            max_degree=(max_degree if max_degree is not None
+                        else config['max_degree']),
+            df_accounting=(df_accounting if df_accounting is not None
+                           else config['df_accounting']),
             fixed_transforms=fixed_transforms,
             verbose=verbose,
         )
@@ -320,9 +328,10 @@ class MFPFitter(BaseModelFitter):
                     n_params += 2
             return n_params
 
-        # Pre-fit estimate: worst case (all variables as FP2)
+        # Pre-fit estimate: worst case within the permitted family
         n_features = X.shape[1] if X.ndim > 1 else 1
-        return 2 * n_features + 1
+        max_degree = self._config(model_type)['max_degree']
+        return (1 if max_degree <= 1 else 2) * n_features + 1
 
     def get_model_description(self, model_type: str) -> str:
         """
@@ -334,8 +343,12 @@ class MFPFitter(BaseModelFitter):
         :returns: Human-readable description.
         :rtype: str
         """
-        return (
-            'MFP: Multivariable Fractional Polynomials — '
-            'automatically discovers optimal non-linear transformations '
-            'and performs backward variable selection.'
-        )
+        base = ('MFP: Multivariable Fractional Polynomials, discovers '
+                'non-linear transformations and performs backward '
+                'variable selection')
+        detail = {
+            'mfp': 'up to FP2 per variable (legacy df accounting)',
+            'mfp1': 'at most one term per variable (FP1)',
+            'mfp2': 'up to two terms per variable (FP2)',
+        }[model_type]
+        return f'{base}; {detail}.'

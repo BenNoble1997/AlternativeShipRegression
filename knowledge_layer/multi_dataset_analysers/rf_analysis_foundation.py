@@ -20,9 +20,9 @@ import numpy as np
 from typing import List, Dict, Optional, Tuple
 from sklearn.ensemble import RandomForestRegressor
 
-from config import LoggerMixin
+from config.loggermixin.logger_config import LoggerMixin
 from knowledge_layer.fleet_data_class.matched_dataset_creation import MatchedDataset
-
+from knowledge_layer.fleet_data_class.temporal_eligibility import TemporalEligibility
 
 class RandomForestAnalysisFoundation(LoggerMixin):
     """
@@ -49,7 +49,15 @@ class RandomForestAnalysisFoundation(LoggerMixin):
                  random_state: int = 42,
                  verbose: bool = True,
                  selection_metric:str = 'rrmse',
-                 target_predictor_constraints:dict[str,list[str]]=None):
+                 target_predictor_constraints:dict[str,list[str]]=None,
+                defer_matched_sets: bool = False,
+                 n_matches_per_ship:int=10,
+                 caliper:float|None=None,
+                 build_year_col:str|None=None,
+                 year_edges:list[int]=None,
+                 matching_bins:dict[str,list[str]]=None,
+                 eligibility:TemporalEligibility|None=None,
+                 ):
         """
         Initialize RF analysis foundation.
 
@@ -93,9 +101,14 @@ class RandomForestAnalysisFoundation(LoggerMixin):
             target_dimensions=target_dimensions
         )
 
+        self.build_year_col = build_year_col
+        self.year_edges = year_edges
+        self.build_eligibility = eligibility
+        self.matching_bins = matching_bins
+
         # Store datasets
-        self.conventional_full = conventional_data[self.available_dimensions].copy()
-        self.alternative = alternative_data[self.available_dimensions].copy()
+        self.conventional_full = self._resolve_data_variables(name='conventional_full', data=conventional_data.copy())
+        self.alternative = self._resolve_data_variables(name='alternative', data=alternative_data.copy())
 
         # Validate and store selector results
         self._validate_selector_results(selector_results)
@@ -112,6 +125,9 @@ class RandomForestAnalysisFoundation(LoggerMixin):
             'oob_score': True
         }
 
+        self.n_matches_per_ship = n_matches_per_ship
+        self.caliper = caliper
+
         # Validate data quality
         self._validate_data_quality()
 
@@ -119,13 +135,73 @@ class RandomForestAnalysisFoundation(LoggerMixin):
         if verbose:
             self.print_variable_diagnostics()
 
-        # Create matched datasets (now with filtering)
-        self.matched_data_sets = self._create_matched_sets()
+        # Matched sets: build now (legacy) or defer until the analyzer has
+        # split the conventional data and can supply the test partition.
+        if defer_matched_sets:
+            self.matched_data_sets = {}
+            if verbose:
+                print("\n  Matched dataset creation deferred — call "
+                      "build_matched_sets(candidate_pool=...) after the "
+                      "train/test split.")
+        else:
+            self.matched_data_sets = self._create_matched_sets()
+
+        self.selector = None  # Will be set by analyzer if available
+
+
 
 
     # ========================================================================
     # SETUP AND VALIDATION
     # ========================================================================
+
+    def _resolve_data_variables(self, name, data):
+        """
+        resolve which variables should be extracted and used in the datasets.
+
+
+        :return:
+        """
+
+        retained = list(self.available_dimensions)
+
+        if self.build_year_col is not None:
+
+            if self.build_year_col not in data.columns:
+                raise KeyError(
+                    f"build_year_col '{self.build_year_col}' is not a column of the "
+                    f"{name} dataset, so build-year blocking cannot be applied."
+                )
+            retained.append(self.build_year_col)
+
+        if self.build_eligibility is not None:
+
+            if self.build_eligibility.anchor_column not in data.columns:
+                raise KeyError(
+                    f"build_year_col '{self.build_eligibility.anchor_column}' is not a column of the "
+                    f"{name} dataset, so build-year blocking cannot be applied."
+                )
+            retained.append(self.build_eligibility.anchor_column)
+
+        if self.matching_bins is not None:
+
+            if isinstance(self.matching_bins, list):
+                columns = self.matching_bins
+            else:
+                columns = self.matching_bins.keys()
+
+            for column in columns:
+                if column not in data.columns:
+                    raise KeyError(
+                            f"build_year_col '{column}' is not a column of the "
+                            f"{name} dataset, so build-year blocking cannot be applied."
+                        )
+                retained.append(column)
+
+        result = data[list(set(retained))].copy()
+
+
+        return result
 
     def _print_constraint_summary(self):
         """Print a summary of active target predictor constraints."""
@@ -225,6 +301,158 @@ class RandomForestAnalysisFoundation(LoggerMixin):
             if len(dataset) < 10:
                 print(f"\n  ⚠️  WARNING: {dataset_name} dataset is very small "
                       f"({len(dataset)} ships)")
+
+    def _create_matched_sets(self,
+                             candidate_pool: pd.DataFrame | None = None
+                             ) -> dict[tuple[str, ...], pd.DataFrame]:
+        """
+        Create matched conventional datasets for each predictor combination.
+
+        Matching is one dataset per unique predictor tuple, matched on exactly
+        those predictors via standardized Euclidean distance.
+
+        :param candidate_pool: Conventional ships eligible to be selected as
+            matches. When ``None``, the full conventional fleet is used
+            (legacy behaviour, which leaks training ships into matched-set
+            evaluation). When the analyzer supplies its held-out test
+            partition, matched-set evaluation is strictly out-of-sample.
+        :type candidate_pool: pandas.DataFrame or None
+        :returns: Mapping ``predictor_tuple → matched_dataset``.
+        :rtype: dict[tuple[str, ...], pandas.DataFrame]
+        :raises ValueError: If no valid predictor combinations remain after
+            availability filtering.
+        :raises KeyError: If matching fails due to a predictor missing from
+            the candidate pool's columns.
+        """
+        pool = candidate_pool if candidate_pool is not None else self.conventional_full
+
+        # Collect all unique predictor combinations
+        combo_list = []
+        for target in self.target_dimensions:
+            combos = self.extract_combinations_for_target(target)
+            combo_list.extend(combos)
+
+        all_unique_combos = sorted(set(combo_list))
+
+        valid_combos = []
+        skipped_combos = []
+
+        for combo in all_unique_combos:
+            if all(pred in self.available_dimensions for pred in combo):
+                valid_combos.append(combo)
+            else:
+                missing = [pred for pred in combo if pred not in self.available_dimensions]
+                skipped_combos.append((combo, missing))
+
+        if skipped_combos and self.verbose:
+            print(f"\n⚠️  Skipped {len(skipped_combos)} combinations due to missing variables:")
+            for combo, missing in skipped_combos[:5]:
+                print(f"  • {combo}: missing {missing}")
+            if len(skipped_combos) > 5:
+                print(f"  • ... and {len(skipped_combos) - 5} more")
+            print()
+
+        if not valid_combos:
+            raise ValueError(
+                "No valid predictor combinations found after filtering!\n"
+                f"All {len(all_unique_combos)} combinations from selector contain variables "
+                f"not present in the current datasets.\n"
+                f"Available dimensions: {self.available_dimensions}\n"
+                f"Consider passing the same variable list to analyzer as was used in selector."
+            )
+
+        if self.verbose:
+            pool_desc = ("held-out test partition" if candidate_pool is not None
+                         else "FULL conventional fleet (legacy — includes train ships)")
+            print(f"\nCreating matched datasets for {len(valid_combos)} valid predictor "
+                  f"combinations from {pool_desc} ({len(pool)} candidate ships)...")
+
+        try:
+
+            if self.build_eligibility is not None:
+                matched_sets = MatchedDataset.multiple_matched_datasets(
+                    alternative_fleet=self.alternative,
+                    conventional_fleet=pool,
+                    logger=self.logger,
+                    predictor_groups=valid_combos,
+                    std_reference='conventional',
+                    n_matches_per_ship=self.n_matches_per_ship,
+                    eligibility=self.build_eligibility,
+                    caliper=self.caliper,
+                    binning_features=self.matching_bins
+                )
+
+            elif self.build_year_col is not None:
+                alt_fleet,conv_fleet = MatchedDataset.add_build_year_window(alternative_fleet=self.alternative,
+                                                     conventional_fleet=pool,
+                                                     year_column=self.build_year_col, edges=self.year_edges)
+
+                matched_sets = MatchedDataset.multiple_matched_datasets(
+                    alternative_fleet=alt_fleet,
+                    conventional_fleet=conv_fleet,
+                    logger=self.logger,
+                    predictor_groups=valid_combos,
+                    std_reference='conventional',
+                    n_matches_per_ship=self.n_matches_per_ship,
+                    binning_features=['BUILD_YEAR_WINDOW'],
+                    caliper=self.caliper
+                )
+
+            else:
+
+                matched_sets = MatchedDataset.multiple_matched_datasets(
+                    alternative_fleet=self.alternative,
+                    conventional_fleet=pool,
+                    logger=self.logger,
+                    predictor_groups=valid_combos,
+                    std_reference='conventional',
+                    n_matches_per_ship=self.n_matches_per_ship,
+                    caliper=self.caliper,
+                    binning_features=self.matching_bins
+                )
+        except KeyError as e:
+            raise KeyError(
+                f"Matched dataset creation failed: {str(e)}\n"
+                f"This suggests a predictor variable exists in available_dimensions "
+                f"but not in the candidate pool's columns.\n"
+                f"Available dimensions: {self.available_dimensions}\n"
+                f"Pool columns: {list(pool.columns)}"
+            ) from e
+
+        if self.verbose:
+            print(f"✅ Created {len(matched_sets)} matched datasets")
+
+        return matched_sets
+
+    def build_matched_sets(self,
+                           candidate_pool: pd.DataFrame | None = None,
+                           debug: bool = False) -> None:
+        """
+        Build (or rebuild) the matched conventional datasets.
+
+        Intended to be called by the owning analyzer after it has performed
+        its train/test split, passing the held-out test partition as the
+        candidate pool. This guarantees that matched-set evaluation never
+        scores the model on ships it was trained on, which is essential for
+        fair parametric-vs-Random-Forest gap comparisons (flexible models
+        memorise training points and would otherwise show deflated matched
+        error).
+
+        :param candidate_pool: Conventional ships eligible as match candidates
+            (typically the analyzer's ``conventional_test``). ``None`` falls
+            back to the full conventional fleet.
+        :type candidate_pool: pandas.DataFrame or None
+        :param debug: Print candidate pool size and per-combination matched
+            sizes after construction.
+        :type debug: bool
+        """
+        self.matched_data_sets = self._create_matched_sets(candidate_pool=candidate_pool)
+
+        if debug:
+            pool_n = len(candidate_pool) if candidate_pool is not None else len(self.conventional_full)
+            print(f"[build_matched_sets] candidate pool: {pool_n} ships")
+            for combo, df in self.matched_data_sets.items():
+                print(f"[build_matched_sets]   {' + '.join(combo):35s} → matched n = {len(df)}")
 
     # ========================================================================
     # COMBINATION EXTRACTION FROM SELECTOR RESULTS
@@ -343,69 +571,69 @@ class RandomForestAnalysisFoundation(LoggerMixin):
     # ========================================================================
     # MATCHED DATASET CREATION
     # ========================================================================
-
-    def _create_matched_sets(self) -> Dict[Tuple[str, ...], pd.DataFrame]:
-        """
-        Create matched conventional datasets for each predictor combination.
-
-        Returns
-        -------
-        dict
-            Maps predictor_tuple → matched_dataset_df
-        """
-        # Collect all unique predictor combinations
-        combo_list = []
-        for target in self.target_dimensions:
-            combos = self.extract_combinations_for_target(target)
-            combo_list.extend(combos)
-
-        # Get unique combinations
-        all_unique_combos = sorted(set(combo_list))
-
-        # ✅ FILTER: Only keep combinations where ALL predictors are available
-        valid_combos = []
-        skipped_combos = []
-
-        for combo in all_unique_combos:
-            if all(pred in self.available_dimensions for pred in combo):
-                valid_combos.append(combo)
-            else:
-                missing = [pred for pred in combo if pred not in self.available_dimensions]
-                skipped_combos.append((combo, missing))
-
-        # Report skipped combinations
-        if skipped_combos and self.verbose:
-            print(f"\n⚠️  Skipped {len(skipped_combos)} combinations due to missing variables:")
-            for combo, missing in skipped_combos[:5]:
-                print(f"  • {combo}: missing {missing}")
-            if len(skipped_combos) > 5:
-                print(f"  • ... and {len(skipped_combos) - 5} more")
-            print()
-
-        if not valid_combos:
-            raise ValueError(
-                "No valid predictor combinations found after filtering!\n"
-                f"All {len(all_unique_combos)} combinations from selector contain variables "
-                f"not present in the current datasets."
-            )
-
-        if self.verbose:
-            print(f"\nCreating matched datasets for {len(valid_combos)} valid predictor combinations "
-                  f"(filtered from {len(all_unique_combos)} total)...")
-
-        # Create matched datasets
-        matched_sets = MatchedDataset.multiple_matched_datasets(
-            alternative_fleet=self.alternative,
-            conventional_fleet=self.conventional_full,
-            logger=self.logger,
-            predictor_groups=valid_combos,
-            std_reference='conventional'
-        )
-
-        if self.verbose:
-            print(f"✅ Created {len(matched_sets)} matched datasets")
-
-        return matched_sets
+    #
+    # def _create_matched_sets(self) -> Dict[Tuple[str, ...], pd.DataFrame]:
+    #     """
+    #     Create matched conventional datasets for each predictor combination.
+    #
+    #     Returns
+    #     -------
+    #     dict
+    #         Maps predictor_tuple → matched_dataset_df
+    #     """
+    #     # Collect all unique predictor combinations
+    #     combo_list = []
+    #     for target in self.target_dimensions:
+    #         combos = self.extract_combinations_for_target(target)
+    #         combo_list.extend(combos)
+    #
+    #     # Get unique combinations
+    #     all_unique_combos = sorted(set(combo_list))
+    #
+    #     # ✅ FILTER: Only keep combinations where ALL predictors are available
+    #     valid_combos = []
+    #     skipped_combos = []
+    #
+    #     for combo in all_unique_combos:
+    #         if all(pred in self.available_dimensions for pred in combo):
+    #             valid_combos.append(combo)
+    #         else:
+    #             missing = [pred for pred in combo if pred not in self.available_dimensions]
+    #             skipped_combos.append((combo, missing))
+    #
+    #     # Report skipped combinations
+    #     if skipped_combos and self.verbose:
+    #         print(f"\n⚠️  Skipped {len(skipped_combos)} combinations due to missing variables:")
+    #         for combo, missing in skipped_combos[:5]:
+    #             print(f"  • {combo}: missing {missing}")
+    #         if len(skipped_combos) > 5:
+    #             print(f"  • ... and {len(skipped_combos) - 5} more")
+    #         print()
+    #
+    #     if not valid_combos:
+    #         raise ValueError(
+    #             "No valid predictor combinations found after filtering!\n"
+    #             f"All {len(all_unique_combos)} combinations from selector contain variables "
+    #             f"not present in the current datasets."
+    #         )
+    #
+    #     if self.verbose:
+    #         print(f"\nCreating matched datasets for {len(valid_combos)} valid predictor combinations "
+    #               f"(filtered from {len(all_unique_combos)} total)...")
+    #
+    #     # Create matched datasets
+    #     matched_sets = MatchedDataset.multiple_matched_datasets(
+    #         alternative_fleet=self.alternative,
+    #         conventional_fleet=self.conventional_full,
+    #         logger=self.logger,
+    #         predictor_groups=valid_combos,
+    #         std_reference='conventional'
+    #     )
+    #
+    #     if self.verbose:
+    #         print(f"✅ Created {len(matched_sets)} matched datasets")
+    #
+    #     return matched_sets
 
     def get_matched_dataset(self, predictors: Tuple[str, ...]) -> Optional[pd.DataFrame]:
         """Get matched dataset for a specific predictor combination."""
