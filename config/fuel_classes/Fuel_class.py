@@ -396,7 +396,6 @@ class Fuel(LoggerMixin):
     """
     A class representing fuel properties used in ship energy systems.
 
-
     """
 
     fuel_registry = {}
